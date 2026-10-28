@@ -3,10 +3,17 @@
 import dataclasses
 import math
 import os
+import pathlib
 
 from .github import github_token
 
-__all__ = ["Settings", "ghark_poll_seconds", "ghark_batch_seconds", "settings_from_env"]
+__all__ = [
+    "Settings",
+    "ghark_batch_seconds",
+    "ghark_log_file",
+    "ghark_poll_seconds",
+    "settings_from_env",
+]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -33,6 +40,14 @@ def ghark_poll_seconds(default: float = 30, minimum: float = 5) -> float:
 def ghark_batch_seconds(default: float = 5, minimum: float = 0) -> float:
     seconds = _environ_get_float("GHARK_BATCH_SECONDS", default)
     return _seconds(seconds, default, minimum)
+
+
+def ghark_log_file() -> pathlib.Path:
+    """Log path; the MCP client may not keep the server's stderr."""
+    if path := os.environ.get("GHARK_LOG_FILE"):
+        return pathlib.Path(path).expanduser()
+    state = os.environ.get("XDG_STATE_HOME") or pathlib.Path.home() / ".local/state"
+    return pathlib.Path(state) / "ghark" / "ghark.log"
 
 
 def _environ_get_float(key: str, default: float | None = None) -> float:

@@ -95,4 +95,10 @@ Set `GHARK_POLL_SECONDS` to change the polling interval. The default is 30
 seconds. Set `GHARK_BATCH_SECONDS` to change the event coalescing window. The
 default is 5 seconds.
 
+The server logs to stderr and to `~/.local/state/ghark/ghark.log` (or
+`$XDG_STATE_HOME/ghark/ghark.log`). Set `GHARK_LOG_FILE` to change the path.
+Each line carries the process ID. The log records why each process stopped:
+the client closed the connection, a signal, or an uncaught exception. A log
+that ends without one of these means the process was killed with SIGKILL.
+
 See [DESIGN.md](DESIGN.md) for architecture and behavior details.

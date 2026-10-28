@@ -7,14 +7,21 @@ import json
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from collections.abc import Callable
 from typing import Any
 
+import anyio
 import httpx
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.server.models import InitializationOptions
+from mcp.server.session import ServerSession
+from mcp.shared.message import SessionMessage
+from mcp.types import ServerCapabilities
 
+import ghark.channel
 import ghark.github
 import ghark.models
 import ghark.session
@@ -401,12 +408,46 @@ class RecordedGitHubTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
 
 
+class ClaudeChannelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_writes_channel_notification(self) -> None:
+        pr = ghark.models.PullRequestRef("owner", "repo", 12)
+        event = ghark.models.ActivityEvent(
+            pr, _snapshot(), ghark.models.ActivityKind.REVIEW, "APPROVED", "alice"
+        )
+        client_send, server_read = anyio.create_memory_object_stream[
+            SessionMessage | Exception
+        ](1)
+        server_write, client_read = anyio.create_memory_object_stream[SessionMessage](1)
+        options = InitializationOptions(
+            server_name="ghark",
+            server_version="0.1.0",
+            capabilities=ServerCapabilities(),
+        )
+        channel = ghark.channel.ClaudeChannel()
+        async with client_send, server_read, server_write, client_read:
+            channel.attach(ServerSession(server_read, server_write, options))
+            with self.assertNoLogs("ghark"):
+                await channel.send((event,))
+            sent = client_read.receive_nowait().message.root
+
+        self.assertEqual(sent.method, "notifications/claude/channel")
+        self.assertEqual(
+            sent.params["meta"],
+            {"repo": "owner/repo", "number": "12", "event_count": "1"},
+        )
+        self.assertIn("review: APPROVED (by alice)", sent.params["content"])
+
+
 class MCPServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_stdio_server_lists_and_serves_tools(self) -> None:
+        log_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(log_dir.cleanup)
+        log_file = pathlib.Path(log_dir.name) / "ghark.log"
         parameters = StdioServerParameters(
             command=sys.executable,
             args=["-m", "ghark"],
-            env=os.environ | {"GH_TOKEN": "test-token"},
+            env=os.environ
+            | {"GH_TOKEN": "test-token", "GHARK_LOG_FILE": str(log_file)},
             cwd=str(pathlib.Path.cwd()),
         )
         async with asyncio.timeout(15):
@@ -431,6 +472,10 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
             unsubscribed.structuredContent,
             {"status": "not_subscribed", "pr": "owner/repo#12"},
         )
+        log = log_file.read_text()
+        self.assertIn("ghark 0.1.0 started", log)
+        self.assertIn("Client closed the connection; shutting down.", log)
+        self.assertTrue(log.rstrip().endswith("ghark stopped."))
 
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"

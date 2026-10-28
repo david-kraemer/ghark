@@ -2,9 +2,10 @@
 
 import dataclasses
 import logging
+from typing import Any
 
 from mcp.server.session import ServerSession
-from mcp.types import JSONRPCNotification
+from mcp.types import Notification
 
 from .models import ActivityEvent, ChannelMessage
 
@@ -15,7 +16,11 @@ logger = logging.getLogger("ghark")
 
 @dataclasses.dataclass(slots=True)
 class ClaudeChannel:
-    """Write best-effort channel notifications to the active MCP session."""
+    """Write best-effort channel notifications to the active MCP session.
+
+    ``send`` never raises: it runs in the poller task, and an exception there
+    ends the server process along with every subscription.
+    """
 
     _session: ServerSession | None = dataclasses.field(default=None, repr=False)
 
@@ -26,11 +31,12 @@ class ClaudeChannel:
         if self._session is None:
             return
         for message in ChannelMessage.from_events(events):
-            notification = JSONRPCNotification(
-                method="notifications/claude/channel",
-                params=message.as_dict(),
-            )
             try:
+                # The session adds the JSON-RPC envelope; pass only the body.
+                notification = Notification[dict[str, Any], str](
+                    method="notifications/claude/channel",
+                    params=message.as_dict(),
+                )
                 await self._session.send_notification(notification)  # type: ignore[arg-type]
             except Exception:
                 logger.exception(

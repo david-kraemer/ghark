@@ -3,6 +3,12 @@
 import contextlib
 import enum
 import logging
+import logging.handlers
+import os
+import pathlib
+import signal
+import sys
+import types
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -12,13 +18,17 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, TextContent, Tool
 
 from .channel import ClaudeChannel
-from .config import Settings, settings_from_env
+from .config import Settings, ghark_log_file, settings_from_env
 from .github import GitHubClient, GitHubError
 from .models import PullRequestRef
 from .session import SessionState
 from .watcher import PullRequestPoller
 
 __all__ = ["create_server", "serve", "main"]
+
+__version__ = "0.1.0"
+
+logger = logging.getLogger("ghark")
 
 SERVER_INSTRUCTIONS = """
 Watch GitHub pull requests for this session. Events can arrive as channel
@@ -106,7 +116,10 @@ def create_server(
                 tasks.cancel_scope.cancel()
 
     server = Server(
-        "ghark", version="0.1.0", instructions=SERVER_INSTRUCTIONS, lifespan=lifespan
+        "ghark",
+        version=__version__,
+        instructions=SERVER_INSTRUCTIONS,
+        lifespan=lifespan,
     )
 
     @server.list_tools()
@@ -180,10 +193,6 @@ def _tool_error(message: str) -> CallToolResult:
 
 
 async def serve() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
     settings = settings_from_env()
     github = GitHubClient(settings.github_token)
     state = SessionState(max_pending=settings.max_pending_events)
@@ -195,12 +204,57 @@ async def serve() -> None:
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, options)
+        logger.info("Client closed the connection; shutting down.")
     finally:
         await github.close()
 
 
 def main() -> None:
-    anyio.run(serve)
+    """Run the server and log why it stopped.
+
+    The exit reason is one of: the client closed the connection, a signal,
+    or an uncaught exception. A log that ends without one means SIGKILL.
+    """
+    _configure_logging(ghark_log_file())
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, _log_signal_and_exit)
+    logger.info("ghark %s started (pid %d).", __version__, os.getpid())
+    try:
+        anyio.run(serve)
+    except BaseException:
+        logger.exception("ghark stopped on an uncaught exception.")
+        raise
+    logger.info("ghark stopped.")
+
+
+def _log_signal_and_exit(signum: int, _frame: types.FrameType | None) -> None:
+    """Record the signal, then die by it as the default handler would.
+
+    A graceful cancel would hang: the stdin reader blocks in a worker thread
+    that cancellation cannot interrupt.
+    """
+    logger.warning("Received %s; exiting.", signal.Signals(signum).name)
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def _configure_logging(log_file: pathlib.Path) -> None:
+    """Log to stderr and to a shared file; the process ID separates sessions."""
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=1_000_000, backupCount=3
+            )
+        )
+    except OSError as exc:
+        print(f"ghark: not logging to {log_file}: {exc}", file=sys.stderr)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(process)d %(levelname)s %(message)s",
+        handlers=handlers,
+    )
 
 
 if __name__ == "__main__":

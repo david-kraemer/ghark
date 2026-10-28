@@ -101,6 +101,10 @@ The server does not perform actions on a PR.
   oldest events and reports the dropped count through `pending_events`.
 - State is local to a running process. Restarting loses subscriptions and
   unread events.
+- MCP clients may not keep a server's stderr after startup, so the server
+  also logs to a file and records its exit reason there. An exception that
+  escapes the poller task ends the process; channel delivery therefore never
+  raises.
 - Claude Code channel support is experimental and requires its channel launch
   option. Unsupported clients ignore the extension and can call
   `pending_events`.
