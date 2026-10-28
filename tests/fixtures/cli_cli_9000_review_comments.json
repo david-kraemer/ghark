@@ -1,0 +1,144 @@
+[
+  {
+    "url": "https://api.github.com/repos/cli/cli/pulls/comments/1583153997",
+    "pull_request_review_id": 2028628010,
+    "id": 1583153997,
+    "node_id": "PRRC_kwDODKw3uc5eXQNN",
+    "diff_hunk": "@@ -127,6 +127,7 @@ func NewVerifyCmd(f *cmdutil.Factory, runF func(*Options) error) *cobra.Command\n \n \t// general flags\n \tverifyCmd.Flags().StringVarP(&opts.BundlePath, \"bundle\", \"b\", \"\", \"Path to bundle on disk, either a single bundle in a JSON file or a JSON lines file with multiple bundles\")\n+\tcmdutil.DisableAuthCheckFlag(verifyCmd.Flags().Lookup(\"bundle\"))",
+    "path": "pkg/cmd/attestation/verify/verify.go",
+    "commit_id": "cc36d32a212a2b8b6611fb73549fe6d04fb6ec38",
+    "original_commit_id": "8e3afe55df03749343d3771c804106dc2a476f2a",
+    "user": {
+      "login": "williammartin",
+      "id": 1611510,
+      "node_id": "MDQ6VXNlcjE2MTE1MTA=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1611510?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/williammartin",
+      "html_url": "https://github.com/williammartin",
+      "followers_url": "https://api.github.com/users/williammartin/followers",
+      "following_url": "https://api.github.com/users/williammartin/following{/other_user}",
+      "gists_url": "https://api.github.com/users/williammartin/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/williammartin/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/williammartin/subscriptions",
+      "organizations_url": "https://api.github.com/users/williammartin/orgs",
+      "repos_url": "https://api.github.com/users/williammartin/repos",
+      "events_url": "https://api.github.com/users/williammartin/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/williammartin/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": true
+    },
+    "body": "Could I interest you in the following tests:\r\n\r\n```go\r\nfunc TestVerifyCmdAuthChecks(t *testing.T) {\r\n\tf := &cmdutil.Factory{}\r\n\r\n\tt.Run(\"by default auth check is required\", func(t *testing.T) {\r\n\t\tcmd := NewVerifyCmd(f, func(o *Options) error {\r\n\t\t\treturn nil\r\n\t\t})\r\n\r\n\t\t// IsAuthCheckEnabled assumes commands under test are subcommands\r\n\t\tparent := &cobra.Command{Use: \"root\"}\r\n\t\tparent.AddCommand(cmd)\r\n\r\n\t\trequire.NoError(t, cmd.ParseFlags([]string{}))\r\n\t\trequire.True(t, cmdutil.IsAuthCheckEnabled(cmd), \"expected auth check to be required\")\r\n\t})\r\n\r\n\tt.Run(\"when --bundle flag is provided, auth check is not required\", func(t *testing.T) {\r\n\t\tcmd := NewVerifyCmd(f, func(o *Options) error {\r\n\t\t\treturn nil\r\n\t\t})\r\n\r\n\t\t// IsAuthCheckEnabled assumes commands under test are subcommands\r\n\t\tparent := &cobra.Command{Use: \"root\"}\r\n\t\tparent.AddCommand(cmd)\r\n\r\n\t\trequire.NoError(t, cmd.ParseFlags([]string{\"--bundle\", \"not-important\"}))\r\n\t\trequire.False(t, cmdutil.IsAuthCheckEnabled(cmd), \"expected auth check not to be required due to --bundle flag\")\r\n\t})\r\n}\r\n```\r\n\r\nThe alternative here is to check the annotation is set on the flag, but this seems more robust in the long term to catch regressions.",
+    "created_at": "2024-04-29T14:06:54Z",
+    "updated_at": "2024-04-29T15:00:09Z",
+    "html_url": "https://github.com/cli/cli/pull/9000#discussion_r1583153997",
+    "pull_request_url": "https://api.github.com/repos/cli/cli/pulls/9000",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/cli/cli/pulls/comments/1583153997"
+      },
+      "html": {
+        "href": "https://github.com/cli/cli/pull/9000#discussion_r1583153997"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/cli/cli/pulls/9000"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/cli/cli/pulls/comments/1583153997/reactions",
+      "total_count": 2,
+      "+1": 1,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 1
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 130,
+    "original_line": 130,
+    "side": "RIGHT",
+    "author_association": "MEMBER",
+    "original_position": 4,
+    "position": 4,
+    "subject_type": "line",
+    "is_copilot_code_review": false,
+    "copilot_code_review_sources": []
+  },
+  {
+    "url": "https://api.github.com/repos/cli/cli/pulls/comments/1583234287",
+    "pull_request_review_id": 2028628010,
+    "id": 1583234287,
+    "node_id": "PRRC_kwDODKw3uc5eXjzv",
+    "diff_hunk": "@@ -53,3 +54,66 @@ func Test_CheckAuth(t *testing.T) {\n \t\t})\n \t}\n }\n+\n+func Test_IsAuthCheckEnabled(t *testing.T) {\n+\ttests := []struct {\n+\t\tname               string\n+\t\tinit               func() (*cobra.Command, error)\n+\t\tisAuthCheckEnabled bool\n+\t}{\n+\t\t{\n+\t\t\tname: \"no annotations\",\n+\t\t\tinit: func() (*cobra.Command, error) {\n+\t\t\t\tcmd := &cobra.Command{}\n+\t\t\t\tcmd.Flags().Bool(\"flag\", false, \"\")\n+\t\t\t\treturn cmd, nil\n+\t\t\t},\n+\t\t\tisAuthCheckEnabled: true,\n+\t\t},\n+\t\t{\n+\t\t\tname: \"command-level disable\",\n+\t\t\tinit: func() (*cobra.Command, error) {\n+\t\t\t\tcmd := &cobra.Command{}\n+\t\t\t\tDisableAuthCheck(cmd)\n+\t\t\t\treturn cmd, nil\n+\t\t\t},\n+\t\t\tisAuthCheckEnabled: false,\n+\t\t},\n+\t\t{\n+\t\t\tname: \"command with flag-level disable, flag not set\",\n+\t\t\tinit: func() (*cobra.Command, error) {\n+\t\t\t\tcmd := &cobra.Command{}\n+\t\t\t\tcmd.Flags().Bool(\"flag\", false, \"\")\n+\t\t\t\tDisableAuthCheckFlag(cmd.Flag(\"flag\"))\n+\t\t\t\treturn cmd, nil\n+\t\t\t},\n+\t\t\tisAuthCheckEnabled: true,\n+\t\t},\n+\t\t{\n+\t\t\tname: \"command with flag-level disable, flag set\",\n+\t\t\tinit: func() (*cobra.Command, error) {\n+\t\t\t\tcmd := &cobra.Command{}\n+\t\t\t\tcmd.Flags().Bool(\"flag\", false, \"\")\n+\t\t\t\tif err := cmd.Flags().Set(\"flag\", \"true\"); err != nil {\n+\t\t\t\t\treturn nil, err\n+\t\t\t\t}\n+\n+\t\t\t\tDisableAuthCheckFlag(cmd.Flag(\"flag\"))\n+\t\t\t\treturn cmd, nil\n+\t\t\t},\n+\t\t\tisAuthCheckEnabled: false,\n+\t\t},\n+\t}\n+\n+\tfor _, tt := range tests {\n+\t\tt.Run(tt.name, func(t *testing.T) {\n+\t\t\tcmd, err := tt.init()\n+\t\t\trequire.NoError(t, err)\n+\n+\t\t\t// IsAuthCheckEnabled assumes commands under test are subcommands",
+    "path": "pkg/cmdutil/auth_check_test.go",
+    "commit_id": "cc36d32a212a2b8b6611fb73549fe6d04fb6ec38",
+    "original_commit_id": "8e3afe55df03749343d3771c804106dc2a476f2a",
+    "user": {
+      "login": "williammartin",
+      "id": 1611510,
+      "node_id": "MDQ6VXNlcjE2MTE1MTA=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1611510?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/williammartin",
+      "html_url": "https://github.com/williammartin",
+      "followers_url": "https://api.github.com/users/williammartin/followers",
+      "following_url": "https://api.github.com/users/williammartin/following{/other_user}",
+      "gists_url": "https://api.github.com/users/williammartin/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/williammartin/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/williammartin/subscriptions",
+      "organizations_url": "https://api.github.com/users/williammartin/orgs",
+      "repos_url": "https://api.github.com/users/williammartin/repos",
+      "events_url": "https://api.github.com/users/williammartin/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/williammartin/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": true
+    },
+    "body": "Lol not suspicious of coupling at all.",
+    "created_at": "2024-04-29T14:59:46Z",
+    "updated_at": "2024-04-29T15:00:09Z",
+    "html_url": "https://github.com/cli/cli/pull/9000#discussion_r1583234287",
+    "pull_request_url": "https://api.github.com/repos/cli/cli/pulls/9000",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/cli/cli/pulls/comments/1583234287"
+      },
+      "html": {
+        "href": "https://github.com/cli/cli/pull/9000#discussion_r1583234287"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/cli/cli/pulls/9000"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/cli/cli/pulls/comments/1583234287/reactions",
+      "total_count": 1,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 1,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 113,
+    "original_line": 113,
+    "side": "RIGHT",
+    "author_association": "MEMBER",
+    "original_position": 68,
+    "position": 68,
+    "subject_type": "line",
+    "is_copilot_code_review": false,
+    "copilot_code_review_sources": []
+  }
+]

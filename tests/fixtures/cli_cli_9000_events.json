@@ -1,0 +1,113 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "url": "https://github.com/cli/cli/pull/9000",
+        "title": "proof of concept for flag-level disable auth check",
+        "state": "MERGED",
+        "merged": true,
+        "mergeable": "UNKNOWN",
+        "mergeStateStatus": "UNKNOWN",
+        "headRefOid": "cc36d32a212a2b8b6611fb73549fe6d04fb6ec38",
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "statusCheckRollup": null
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "nodes": [
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "messageHeadline": "proof of concept for flag-level disable auth check",
+                "author": {
+                  "name": "Andy Feller"
+                }
+              }
+            },
+            {
+              "__typename": "PullRequestReview",
+              "state": "APPROVED",
+              "author": {
+                "login": "steiza"
+              }
+            },
+            {
+              "__typename": "IssueComment",
+              "body": "@steiza @phillmv : is the manual process I listed above how you would test the feature?\r\n\r\n@williammartin : is there anything about these changes you'd like to see beyond adding tests around the various auth check annotation use cases?",
+              "author": {
+                "login": "andyfeller"
+              }
+            },
+            {
+              "__typename": "IssueComment",
+              "body": "### TL;DR\r\n\r\nLet's move forward with this PR, thanks!\r\n\r\n### Design thoughts\r\n\r\nI appreciate the work you've done here and I think it's pretty clever. That said, for a few reasons I prefer a less abstracted approach as in #8995. I've mentioned this elsewhere but I think that tying the authentication check logic into the cobra lifecycle takes us in a less maintainable direction in the long run. Copying and slightly modifying parts of a comment I made elsewhere so that it's in our public record:\r\n\r\n---\r\n\r\nI think the auth checks are too tightly coupled to Cobra configuration and that the responsibility to make this decision should be owned closer to the business logic. From an architecture astronauting point of view, it's a leaky abstraction and though I don't expect we'll ever swap out cobra, that all the auth checks that the business logic depends upon would no longer be validated preconditions if we did, should give us a hint that it's not where it belongs. Furthermore we see that the root command has become [knowledgable about `gh codespaces` with some hard to understand logic](https://github.com/cli/cli/blob/c465d465a5c60dae4e4759b4383292dab3f77504/pkg/cmd/root/root.go#L77) which should be suspicious.\r\n\r\nFrom a less theoretical point of view, this knowledge living in Cobra configuration makes it hard for the business logic to be specific about when it matters, as we've discovered with this offline verification issue. Additionally, the current situation causes spooky action at a distance and I would argue the situation that `attestation` is facing right now is a direct result of that. Had we looked at another command and seen something like:\r\n\r\n```go\r\nfunc (c MyCommand) Run() error {\r\n    if err := c.SharedActor.EnsureAuthenticated(); err != nil {\r\n       return err\r\n    }\r\n}\r\n```\r\n\r\nWe probably would have realised pretty quickly that authed / not authed was something to look at more closely. I'm not suggesting ^ is the solution, just an indication of code that would have acted as a beacon.\r\n\r\n---\r\n\r\nTo call out a specific example, imagine a command that doesn't know whether authentication is required until some state has been evaluated.\r\n\r\nAll that said, I'm happy to move forward with this PR (plus tests) since you are keen on this approach and the risk is low. Really I just wanted a place to capture thoughts should we run into a situation where we wanted to revisit this decision, and to serve as a mental trigger when we come to thinking about other places where command level auth checks are not sufficient (e.g. `extension install` of public extensions).",
+              "author": {
+                "login": "williammartin"
+              }
+            },
+            {
+              "__typename": "IssueComment",
+              "body": "**Firstly, I want to say I completely agree with you:**\r\n\r\n> I think the auth checks are too tightly coupled to Cobra configuration and that the responsibility to make this decision should be owned closer to the business logic.\r\n\r\nCobra is / should be merely an invocation layer handling flags and arguments to application code while whether authentication is necessary is an application concern.  From a long term goal, I think refactoring the code to ensure application code is responsible for whether authentication is required makes sense.\r\n\r\n**Secondly, I don't think that work is trivial in the short term, necessitating a now solution until we get to the later solution**\r\n\r\nThis draft was only intended as a now solution because authentication is tightly coupled to Cobra event hooks and I couldn't think of a simpler way to add support without significantly refactoring commands and the logic around Cobra event hooks:\r\n\r\nhttps://github.com/cli/cli/blob/7d432bcd3aade1d3e06837052fe7d228138f60cb/pkg/cmd/root/root.go#L73-L86",
+              "author": {
+                "login": "andyfeller"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "messageHeadline": "Test cmdutil.IsAuthCheckEnabled cases",
+                "author": {
+                  "name": "Andy Feller"
+                }
+              }
+            },
+            {
+              "__typename": "PullRequestReview",
+              "state": "COMMENTED",
+              "author": {
+                "login": "williammartin"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "messageHeadline": "Test `gh at verify -b` does not require auth",
+                "author": {
+                  "name": "Andy Feller"
+                }
+              }
+            },
+            {
+              "__typename": "PullRequestReview",
+              "state": "APPROVED",
+              "author": {
+                "login": "williammartin"
+              }
+            },
+            {
+              "__typename": "MergedEvent",
+              "actor": {
+                "login": "andyfeller"
+              }
+            },
+            {
+              "__typename": "ClosedEvent",
+              "actor": {
+                "login": "andyfeller"
+              }
+            }
+          ],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpPPAAABjyqkHvABqzEyNjQ1NzYyOTcx"
+          }
+        }
+      }
+    }
+  }
+}
