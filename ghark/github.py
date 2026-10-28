@@ -5,6 +5,7 @@ import datetime
 import enum
 import logging
 import os
+import subprocess
 from typing import Any, TypeVar
 
 import httpx
@@ -34,11 +35,15 @@ class GitHubError(RuntimeError):
 
 
 def github_token() -> str:
-    """Read the GitHub token from the standard environment variables."""
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if not token:
-        raise GitHubError("Set GH_TOKEN or GITHUB_TOKEN before starting ghark.")
-    return token
+    """Read the GitHub token from the standard environment variables, or else from
+    the ``gh`` CLI's login."""
+    if token := os.environ.get("GH_TOKEN"):
+        return token
+    if token := os.environ.get("GITHUB_TOKEN"):
+        return token
+    if token := gh_auth_token():
+        return token
+    raise GitHubError("Set GH_TOKEN or GITHUB_TOKEN, or log in with gh auth login.")
 
 
 @dataclasses.dataclass(slots=True)
@@ -149,6 +154,14 @@ class GitHubClient:
                 page += 1
         except (httpx.HTTPError, ValueError) as exc:
             raise GitHubError(f"GitHub review comment request failed: {exc}") from exc
+
+
+def gh(*args: str) -> str:
+    return subprocess.run(["gh", *args], capture_output=True, text=True).stdout.strip()
+
+
+def gh_auth_token() -> str:
+    return gh("auth", "token")
 
 
 _GRAPHQL_URL = "https://api.github.com/graphql"
