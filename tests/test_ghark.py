@@ -25,6 +25,7 @@ import ghark.channel
 import ghark.github
 import ghark.models
 import ghark.session
+import ghark.watcher
 
 
 class PullRequestReferenceTests(unittest.TestCase):
@@ -326,7 +327,7 @@ class RecordedGitHubTests(unittest.IsolatedAsyncioTestCase):
     SUBSCRIBED_AT = datetime.datetime(2024, 4, 29, tzinfo=datetime.UTC)
 
     async def test_recorded_poll_reaches_channel_message(self) -> None:
-        state = ghark.session.SessionState()
+        state = ghark.session.SessionState(reviewers=frozenset({"williammartin"}))
         result = await self._observe(_fixture("cli_cli_9000_events.json"), state)
 
         watch = state.watch(self.PR)
@@ -336,20 +337,20 @@ class RecordedGitHubTests(unittest.IsolatedAsyncioTestCase):
 
         kind = ghark.models.ActivityKind
         self.assertEqual(
-            [(event.kind, event.actor) for event in events],
+            [(event.kind, event.actor, event.actionable) for event in events],
             [
-                (kind.COMMIT, "Andy Feller"),
-                (kind.REVIEW, "steiza"),
-                (kind.COMMENT, "andyfeller"),
-                (kind.COMMENT, "williammartin"),
-                (kind.COMMENT, "andyfeller"),
-                (kind.COMMIT, "Andy Feller"),
-                (kind.REVIEW, "williammartin"),
-                (kind.COMMIT, "Andy Feller"),
-                (kind.REVIEW, "williammartin"),
-                (kind.MERGED, "andyfeller"),
-                (kind.THREAD_COMMENT, "williammartin"),
-                (kind.THREAD_COMMENT, "williammartin"),
+                (kind.COMMIT, "Andy Feller", False),
+                (kind.REVIEW, "steiza", False),
+                (kind.COMMENT, "andyfeller", False),
+                (kind.COMMENT, "williammartin", True),
+                (kind.COMMENT, "andyfeller", False),
+                (kind.COMMIT, "Andy Feller", False),
+                (kind.REVIEW, "williammartin", True),
+                (kind.COMMIT, "Andy Feller", False),
+                (kind.REVIEW, "williammartin", True),
+                (kind.MERGED, "andyfeller", False),
+                (kind.THREAD_COMMENT, "williammartin", True),
+                (kind.THREAD_COMMENT, "williammartin", True),
             ],
         )
         self.assertEqual(
@@ -361,7 +362,8 @@ class RecordedGitHubTests(unittest.IsolatedAsyncioTestCase):
             message.content.startswith(
                 "cli/cli#9000: proof of concept for flag-level disable auth check\n"
                 "commit: proof of concept for flag-level disable auth check "
-                "(by Andy Feller); review: APPROVED (by steiza);"
+                "(by Andy Feller); review: APPROVED: This looks like a workable "
+                "alternative to #8995 to me! (by steiza);"
             )
         )
         self.assertIn("\nhttps://github.com/cli/cli/pull/9000\n", message.content)
@@ -406,6 +408,101 @@ class RecordedGitHubTests(unittest.IsolatedAsyncioTestCase):
             return await client.observation(watch)
         finally:
             await client.close()
+
+
+class ReviewerRequestTests(unittest.TestCase):
+    REVIEWERS = frozenset({"reviewer"})
+
+    def test_reviewer_comment_is_actionable(self) -> None:
+        self.assertTrue(_event("COMMENT", "Rename this.", "Reviewer").actionable)
+
+    def test_other_actor_is_not_actionable(self) -> None:
+        self.assertFalse(_event("COMMENT", "Rename this.", "stranger").actionable)
+
+    def test_signed_comment_is_not_actionable(self) -> None:
+        body = "Renamed.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+        self.assertFalse(_event("THREAD_COMMENT", body, "reviewer").actionable)
+
+    def test_bare_approval_is_not_actionable(self) -> None:
+        self.assertFalse(_event("REVIEW", "APPROVED", "reviewer").actionable)
+        self.assertTrue(_event("REVIEW", "CHANGES_REQUESTED", "reviewer").actionable)
+
+    def test_status_change_is_not_actionable(self) -> None:
+        self.assertFalse(_event("CHECKS", "Checks: SUCCESS → FAILURE").actionable)
+
+    def test_pending_review_is_not_reported(self) -> None:
+        entries = ghark.github._timeline_entries(
+            [
+                {"__typename": "PullRequestReview", "state": "PENDING", "body": ""},
+                {"__typename": "PullRequestReview", "state": "COMMENTED", "body": "x"},
+            ]
+        )
+
+        self.assertEqual(
+            entries,
+            (
+                ghark.models.TimelineEntry(
+                    ghark.models.ActivityKind.REVIEW, "COMMENTED: x"
+                ),
+            ),
+        )
+
+
+class PollerWakeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wake_file_gets_one_line_per_pr_with_requests(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        wake_file = pathlib.Path(directory.name) / "1.wake"
+        pr = ghark.models.PullRequestRef("owner", "repo", 12)
+        cursor = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+        state = ghark.session.SessionState(reviewers=frozenset({"reviewer"}))
+        state.subscribe(pr, ghark.models.Baseline(_snapshot(), None, cursor))
+        entries = (
+            ghark.models.TimelineEntry(
+                ghark.models.ActivityKind.COMMENT, "Rename this.", "reviewer"
+            ),
+            ghark.models.TimelineEntry(
+                ghark.models.ActivityKind.COMMENT, "Nice.", "stranger"
+            ),
+        )
+
+        class GitHub:
+            async def observation(
+                self, watch: ghark.models.WatchState
+            ) -> ghark.models.PollResult:
+                return ghark.models.PollResult(_snapshot(), "next", cursor, entries, ())
+
+        poller = ghark.watcher.PullRequestPoller(
+            github=GitHub(),  # type: ignore[arg-type]
+            state=state,
+            channel=ghark.channel.ClaudeChannel(),
+            wake_file=wake_file,
+            interval=30,
+            batch_window=0,
+        )
+        await poller.poll()
+
+        self.assertEqual(
+            wake_file.read_text(),
+            "owner/repo#12: 1 review request(s); call pending_events\n",
+        )
+        self.assertEqual(len(state.flush_pending().events), 2)
+
+    async def test_no_wake_without_requests(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        wake_file = pathlib.Path(directory.name) / "1.wake"
+        poller = ghark.watcher.PullRequestPoller(
+            github=None,  # type: ignore[arg-type]
+            state=ghark.session.SessionState(),
+            channel=ghark.channel.ClaudeChannel(),
+            wake_file=wake_file,
+            interval=30,
+            batch_window=0,
+        )
+        await poller.poll()
+
+        self.assertFalse(wake_file.exists())
 
 
 class ClaudeChannelTests(unittest.IsolatedAsyncioTestCase):
@@ -472,6 +569,7 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
             unsubscribed.structuredContent,
             {"status": "not_subscribed", "pr": "owner/repo#12"},
         )
+        self.assertEqual(list(log_file.parent.glob("*.wake")), [])
         log = log_file.read_text()
         self.assertIn("ghark 0.1.0 started", log)
         self.assertIn("Client closed the connection; shutting down.", log)
@@ -495,6 +593,16 @@ async def _mock_client(
         base_url="https://api.github.com",
     )
     return client
+
+
+def _event(kind: str, body: str, actor: str = "") -> ghark.models.ActivityEvent:
+    return ghark.models.ActivityEvent(
+        ghark.models.PullRequestRef("owner", "repo", 12),
+        _snapshot(),
+        ghark.models.ActivityKind[kind],
+        body,
+        actor,
+    ).for_reviewers(ReviewerRequestTests.REVIEWERS)
 
 
 def _snapshot() -> ghark.models.PullRequestSnapshot:

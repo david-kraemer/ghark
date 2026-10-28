@@ -67,6 +67,11 @@ class GitHubClient:
         """Close the owned HTTP client."""
         await self._client.aclose()
 
+    async def viewer_login(self) -> str:
+        """Read the login of the token's owner."""
+        data = await self._graphql("query { viewer { login } }", {})
+        return data["viewer"]["login"]
+
     async def baseline(self, pr: PullRequestRef) -> Baseline:
         """Read the initial snapshot and timeline cursor for a subscription."""
         review_cursor = datetime.datetime.now(datetime.UTC)
@@ -216,7 +221,7 @@ query PullRequestEvents(
           ... on PullRequestCommit {{
             commit {{ messageHeadline author {{ name }} }}
           }}
-          ... on PullRequestReview {{ state author {{ login }} }}
+          ... on PullRequestReview {{ state body author {{ login }} }}
           ... on IssueComment {{ body author {{ login }} }}
           ... on ClosedEvent {{ actor {{ login }} }}
           ... on ReopenedEvent {{ actor {{ login }} }}
@@ -276,6 +281,8 @@ def _timeline_entries(nodes: list[dict[str, Any]]) -> tuple[TimelineEntry, ...]:
     """
     entries: list[TimelineEntry] = []
     for node in nodes:
+        if node.get("state") == "PENDING":
+            continue  # The viewer's unsubmitted draft review.
         entry = _timeline_entry(node)
         if entry is None:
             logger.warning("Skipped GitHub timeline item: %s", node.get("__typename"))
@@ -296,10 +303,12 @@ def _timeline_entry(node: dict[str, Any]) -> TimelineEntry | None:
             )
         case "PullRequestReview":
             author = node.get("author") or {}
+            state = node.get("state") or "REVIEWED"
+            body = node.get("body") or ""
             return TimelineEntry(
                 ActivityKind.REVIEW,
-                node.get("state", "Review"),
-                author.get("login", ""),
+                f"{state}: {body}" if body else state,
+                author.get("login") or "",
             )
         case "IssueComment":
             author = node.get("author") or {}

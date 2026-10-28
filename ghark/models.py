@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from typing import Any, Self
 
 __all__ = [
+    "CLAUDE_SIGNATURE",
     "ActivityEvent",
     "ActivityKind",
     "Baseline",
@@ -217,10 +218,25 @@ class ActivityEvent:
     kind: ActivityKind
     raw_summary: str
     actor: str = ""
+    actionable: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ActivityKind):
             raise TypeError("ActivityEvent.kind must be an ActivityKind.")
+
+    def for_reviewers(self, reviewers: frozenset[str]) -> Self:
+        """Mark the event actionable when it is a reviewer's request.
+
+        Claude posts with the reviewer's token, so its own comments carry the
+        reviewer's login; the Claude Code signature tells them apart.
+        """
+        actionable = (
+            self.kind in _REQUEST_KINDS
+            and self.actor.lower() in reviewers
+            and self.raw_summary != _BARE_APPROVAL
+            and CLAUDE_SIGNATURE.lower() not in self.raw_summary.lower()
+        )
+        return dataclasses.replace(self, actionable=actionable)
 
     @property
     def summary(self) -> str:
@@ -277,7 +293,7 @@ class ActivityEvent:
         detail = f"{self.kind}: {self.summary}"
         return f"{detail} (by {self.actor})" if self.actor else detail
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, str | bool]:
         return {
             "pr": str(self.pr),
             "url": self.snapshot.url,
@@ -285,6 +301,7 @@ class ActivityEvent:
             "kind": self.kind,
             "summary": self.summary,
             "actor": self.actor,
+            "actionable": self.actionable,
         }
 
 
@@ -313,7 +330,9 @@ class WatchState:
         if self.review_cursor < self.subscribed_at:
             raise ValueError("Review cursor cannot predate the subscription.")
 
-    def events_from(self, result: PollResult) -> Iterator[ActivityEvent]:
+    def events_from(
+        self, result: PollResult, reviewers: frozenset[str]
+    ) -> Iterator[ActivityEvent]:
         timeline = result.timeline_entries
         if result.snapshot.status is PullRequestStatus.MERGED:
             timeline = tuple(
@@ -336,7 +355,7 @@ class WatchState:
                 and comment.created_at >= self.subscribed_at
             ),
         )
-        return entries
+        return (event.for_reviewers(reviewers) for event in entries)
 
     def after_poll(self, result: PollResult) -> Self:
         return dataclasses.replace(
@@ -408,7 +427,7 @@ class ChannelMessage:
             f"{first.header}\n"
             f"{'; '.join(event.detail for event in self.events)}\n"
             f"{first.url}\n"
-            "Notify the user and wait for direction before acting."
+            "Handle it as the ghark server instructions describe."
         )
 
     @property
@@ -434,6 +453,11 @@ class ChannelMessage:
         }
 
 
+CLAUDE_SIGNATURE = "Generated with [Claude Code]"
+_REQUEST_KINDS = frozenset(
+    {ActivityKind.REVIEW, ActivityKind.COMMENT, ActivityKind.THREAD_COMMENT}
+)
+_BARE_APPROVAL = "APPROVED"
 _SLUG = re.compile(r"[A-Za-z0-9_.-]+")
 _PR_URL = re.compile(
     r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9]\d*)/?(?:\?.*)?$"

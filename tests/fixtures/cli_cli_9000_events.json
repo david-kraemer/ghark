@@ -32,6 +32,7 @@
             {
               "__typename": "PullRequestReview",
               "state": "APPROVED",
+              "body": "This looks like a workable alternative to #8995 to me!",
               "author": {
                 "login": "steiza"
               }
@@ -69,6 +70,7 @@
             {
               "__typename": "PullRequestReview",
               "state": "COMMENTED",
+              "body": "One test addition I think would be useful",
               "author": {
                 "login": "williammartin"
               }
@@ -85,6 +87,7 @@
             {
               "__typename": "PullRequestReview",
               "state": "APPROVED",
+              "body": "### Before (without `--bundle`)\r\n\r\n```\r\nGH_CONFIG_DIR=/tmp/test/gh gh attestation verify oci://ghcr.io/phillmv/arquivo -o phillmv                     \r\nTo get started with GitHub CLI, please run:  gh auth login\r\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\r\n```\r\n\r\n### After (without `--bundle`)\r\n\r\n```\r\nGH_CONFIG_DIR=/tmp/test/gh ~/workspace/cli/bin/gh attestation verify oci://ghcr.io/phillmv/arquivo -o phillmv \r\nTo get started with GitHub CLI, please run:  gh auth login\r\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\r\n```\r\n\r\n### Before (with `--bundle`)\r\n\r\n```\r\nGH_CONFIG_DIR=/tmp/test/gh gh attestation verify oci://ghcr.io/phillmv/arquivo -o phillmv --bundle bundle.json \r\nTo get started with GitHub CLI, please run:  gh auth login\r\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\r\n```\r\n\r\n### After (with `--bundle`)\r\n\r\n```\r\nGH_CONFIG_DIR=/tmp/test/gh ~/workspace/cli/bin/gh attestation verify oci://ghcr.io/phillmv/arquivo -o phillmv --bundle bundle.json\r\nLoaded digest sha256:5936c74c8999e9fd50ca0658f378a5d3f8492fb04bd77b952942fdbba4d038bb for oci://ghcr.io/phillmv/arquivo\r\n\u2717 Loading attestations from oci://ghcr.io/phillmv/arquivo failed\r\n\r\nError: bundle could not be loaded from JSON file: open bundle.json: no such file or directory\r\n```\r\n\r\nWe can see in this last case that although the bundle didn't exist (expected error) we did not have the auth check.\r\n\r\nLGTM!",
               "author": {
                 "login": "williammartin"
               }

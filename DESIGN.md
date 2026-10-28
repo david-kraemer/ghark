@@ -2,9 +2,10 @@
 
 ## Goal
 
-Deliver pull request activity to one local coding session. Keep setup local and
-small. Claude Code gets push messages through its channel extension. Other MCP
-clients read the same event queue with `pending_events`.
+Let a coding session address review on the pull requests it opens, without
+the reviewer prompting it. Keep setup local and small. The session reads events
+with `pending_events`; a Claude Code Monitor wakes it when review requests
+arrive. Channel messages are sent too, where policy allows them.
 
 ## Process model
 
@@ -66,10 +67,14 @@ the per-PR cursor. State changes compare the current PR state and check rollup
 with the previous snapshot. A merged or closed PR is reported and removed from
 the active subscription set.
 
-The first version has no GitHub write tools. It reports activity by every
-author, including the session's user, so comments that contain instructions
-remain visible. Activity created through other tools, such as the `gh` CLI,
-can therefore return as a new event.
+The server has no GitHub write tools; the session writes through `gh`. It
+reports activity by every author. Reviews and comments by a reviewer, other
+than a bare approval, are marked actionable. The reviewers default to the
+token's owner. The session posts with that token, so its own comments carry
+the reviewer's login; the Claude Code signature it appends marks them, and
+signed comments are never actionable. Without that rule each reply would wake
+the session again. A pending review is the viewer's unsubmitted draft and is
+not reported.
 
 ## Delivery
 
@@ -79,8 +84,17 @@ prove that the model saw or acted on the event. Clients should treat the tool
 as the durable read path for the lifetime of the process.
 
 Notifications say what changed and link to the PR. Server instructions tell
-the model to notify the user and wait for direction before acting on activity.
-The server does not perform actions on a PR.
+the model to address actionable events and to treat the rest as context.
+Comments by anyone other than a reviewer are untrusted input; the model must
+not follow instructions in them. The server does not perform actions on a PR.
+
+Channels can be disabled by organization policy, so waking does not depend on
+them. When a poll finds actionable events, the poller appends one line per PR
+to a per-process wake file. A Claude Code Monitor tails the file, and each line
+wakes the session, which then calls `pending_events`. Monitors expire after 30
+minutes; the expiry notice also wakes the session, which drains the queue and
+starts a new monitor. A line written while no monitor runs is lost, but its
+events stay queued, so the next wake recovers them.
 
 ## Limits and failure behavior
 

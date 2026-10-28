@@ -24,6 +24,8 @@ class SessionState:
     """
 
     max_pending: int = 1_000
+    #: Lowercase logins whose review activity Claude addresses unprompted.
+    reviewers: frozenset[str] = frozenset()
     _watches: dict[PullRequestRef, WatchState] = dataclasses.field(default_factory=dict)
     _pending: collections.deque[ActivityEvent] = dataclasses.field(
         init=False, repr=False
@@ -58,7 +60,7 @@ class SessionState:
         if self._watches.get(pr) is not previous:
             return ()
 
-        events = tuple(previous.events_from(result))
+        events = tuple(previous.events_from(result, self.reviewers))
         if result.snapshot.is_terminal:
             del self._watches[pr]
         else:

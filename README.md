@@ -1,8 +1,9 @@
 # ghark
 
-`ghark` watches GitHub pull requests and reports new activity to one coding
-session. It runs as a local stdio MCP server. Claude Code can receive live
-channel messages. Any MCP client can ask for pending events.
+`ghark` lets a Claude Code session respond to review on the pull requests it
+opens. When the reviewer comments, the session wakes, makes the changes,
+pushes, and replies, without being told to. It runs as a local stdio MCP
+server.
 
 Each server process owns its subscriptions. No webhook endpoint, public host,
 or shared service is required. The process polls GitHub while the session is
@@ -66,6 +67,25 @@ you want to check for activity.
 The server reports commits, reviews, comments, check status changes, merge
 state changes, and PR closure, merge, or reopen activity. It combines events
 from a PR into a short notification. Merged and closed PRs leave the watch list.
+
+## Review requests
+
+An event is *actionable* when it is a review, issue comment, or review-thread
+comment by a reviewer, other than a bare approval. The reviewers are the logins
+in `GHARK_REVIEWERS` (comma-separated), or by default the token's owner.
+
+Claude posts with the reviewer's token, so its replies carry the reviewer's
+login. The server instructions tell it to end every comment with Claude Code's
+signature, `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+Signed comments are never actionable, so Claude's replies do not wake it.
+
+Actionable events wake the session through Claude Code's Monitor tool, which
+works where channels are disabled by policy. Each server process appends a line
+to `<log directory>/<pid>.wake` when a poll finds review requests. The
+`subscribe` result gives the Monitor command that tails it. A monitor expires
+after 30 minutes; the expiry also wakes the session, which calls
+`pending_events` and starts the monitor again. The wake line is only a signal:
+`pending_events` remains the durable read path.
 
 Subscriptions and unread events live in memory. They end with the stdio server
 process. A restarted session must subscribe again. Channel delivery is best
