@@ -10,8 +10,10 @@ from .github import github_token
 __all__ = [
     "Settings",
     "ghark_batch_seconds",
+    "ghark_discover",
     "ghark_log_file",
     "ghark_poll_seconds",
+    "ghark_project_dir",
     "ghark_reviewers",
     "ghark_wake_file",
     "settings_from_env",
@@ -25,6 +27,8 @@ class Settings:
     batch_window: float = 5
     max_pending_events: int = 1_000
     reviewers: frozenset[str] = frozenset()
+    discover: bool = True
+    project_dir: pathlib.Path = pathlib.Path()
 
 
 def settings_from_env() -> Settings:
@@ -33,6 +37,8 @@ def settings_from_env() -> Settings:
         poll_interval=ghark_poll_seconds(),
         batch_window=ghark_batch_seconds(),
         reviewers=ghark_reviewers(),
+        discover=ghark_discover(),
+        project_dir=ghark_project_dir(),
     )
 
 
@@ -50,6 +56,26 @@ def ghark_reviewers() -> frozenset[str]:
     """Logins in ``GHARK_REVIEWERS``; empty means the token's owner."""
     logins = os.environ.get("GHARK_REVIEWERS", "").split(",")
     return frozenset(login.strip().lower() for login in logins if login.strip())
+
+
+def ghark_discover() -> bool:
+    """Whether to subscribe at startup to the PRs this session owns.
+
+    ``GHARK_DISCOVER`` set to ``0``, ``false``, ``no`` or ``off`` disables it.
+    """
+    value = os.environ.get("GHARK_DISCOVER", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def ghark_project_dir() -> pathlib.Path:
+    """The client's project directory, where discovery looks for a checkout.
+
+    The working directory is a poor default: ``uv run --directory`` moves it to
+    the ghark checkout. Claude Code sets ``CLAUDE_PROJECT_DIR`` for stdio
+    servers; ``PWD`` is inherited from the client and survives uv's chdir.
+    """
+    path = os.environ.get("CLAUDE_PROJECT_DIR") or os.environ.get("PWD")
+    return pathlib.Path(path) if path else pathlib.Path.cwd()
 
 
 def ghark_log_file() -> pathlib.Path:

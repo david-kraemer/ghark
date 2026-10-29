@@ -12,6 +12,7 @@ __all__ = [
     "CLAUDE_SIGNATURE",
     "ActivityEvent",
     "ActivityKind",
+    "AuthoredPullRequest",
     "Baseline",
     "ChannelMessage",
     "CheckState",
@@ -99,6 +100,14 @@ class PullRequestRef:
         else:
             raise ValueError("Use a GitHub PR URL or OWNER/REPO#NUMBER.")
         return cls(owner, repo, int(number))
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AuthoredPullRequest:
+    """An open pull request by the token's owner, with its head branch name."""
+
+    pr: PullRequestRef
+    head_branch: str
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

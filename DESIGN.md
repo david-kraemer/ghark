@@ -12,7 +12,8 @@ arrive. Channel messages are sent too, where policy allows them.
 One stdio server process belongs to one client session. It holds that session's
 subscriptions, GraphQL cursors, pending events, and delivery state in memory.
 This avoids shared state and cross-session routing. Process exit releases all
-state. A resumed session subscribes again.
+state. A new process rediscovers the session's PRs from the project's git
+checkout. See "Restart discovery" below.
 
 The server polls GitHub at a configurable interval. It uses the GitHub GraphQL
 and REST APIs with the token in `GH_TOKEN` or `GITHUB_TOKEN`. It does not accept
@@ -99,6 +100,55 @@ minutes; the expiry notice also wakes the session, which drains the queue and
 starts a new monitor. A line written while no monitor runs is lost, but its
 events stay queued, so the next wake recovers them.
 
+## Restart discovery
+
+Claude Code starts a new server process when a session resumes or restarts.
+The model has no reason to subscribe again. Without discovery, review on PRs
+that already exist would never wake it. Writing subscriptions to disk would
+require keying them to a session that outlives its process. Claude Code exposes
+no stable identifier for that. The git checkout is a durable record that
+already exists, so the server derives its subscriptions from it.
+
+At startup a background task in the server lifespan does the following. It
+starts after initialization, so initialization does not wait for it.
+
+1. It resolves the project directory: `CLAUDE_PROJECT_DIR`, then `PWD`, then
+   the working directory. Claude Code documents `CLAUDE_PROJECT_DIR` for stdio
+   servers, and a running server's environment confirmed it. The working
+   directory is unreliable: `uv run --directory` makes it the ghark checkout.
+   `PWD` is inherited from the client and survives uv's `chdir`. MCP roots
+   (`roots/list`) would also give the launch directory. They need a client
+   round trip after initialization, and the environment variable already
+   answers the question for Claude Code.
+2. It runs `git remote -v` and `git for-each-ref refs/heads/` in that
+   directory, with stdin closed, because stdin carries the MCP transport. It
+   keeps the remotes on `github.com`.
+3. It makes one paginated GraphQL query for the viewer's open PRs. It keeps the
+   PRs whose repository matches a remote, ignoring case, and whose head branch
+   is a local branch. Branches are shared across worktrees, so a PR opened from
+   an agent's worktree branch counts.
+4. It subscribes to each matching PR through the same path as the `subscribe`
+   tool, which sets the baseline and resolves the default reviewer.
+
+Every failure is logged and swallowed. A directory that is not a checkout, a
+git timeout, a GitHub error, or one PR's failed baseline does not stop the
+server or the remaining subscriptions. `GHARK_DISCOVER=0` disables discovery.
+
+The match is a heuristic. Two sessions in one repository discover the same
+PRs, and both wake on their review. The checkout cannot tell them apart. A
+session can unsubscribe PRs it does not own.
+
+Waking needs a running Monitor, and only the model can start one. The server
+instructions say that the server restarts with each session and that older
+monitors have stopped. They tell the model to call `subscriptions` at the
+start of a session, and to start the Monitor that `subscriptions` names when
+anything is listed. The command is in the tool result, not the instructions,
+because the wake file path contains the process ID. The command is listed only
+when PRs are watched, because an idle monitor would wake the session at every
+30-minute expiry for nothing. `subscriptions` waits for discovery to finish,
+for up to 30 seconds, so an early call does not return an empty list while
+discovery is still running.
+
 ## Limits and failure behavior
 
 - GitHub rate limits and network failures delay a poll. The server keeps the
@@ -119,8 +169,8 @@ events stay queued, so the next wake recovers them.
   checks are not polled after the head changes.
 - The unread queue holds up to 1,000 events. If it fills, the server drops the
   oldest events and reports the dropped count through `pending_events`.
-- State is local to a running process. Restarting loses subscriptions and
-  unread events.
+- State is local to a running process. Restarting loses unread events.
+  Subscriptions are rediscovered only for open PRs whose branches are local.
 - MCP clients may not keep a server's stderr after startup, so the server
   also logs to a file and records its exit reason there. An exception that
   escapes the poller task ends the process; channel delivery therefore never

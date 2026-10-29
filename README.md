@@ -60,7 +60,9 @@ you want to check for activity.
 - `subscribe` watches its `pr` argument. It accepts a GitHub PR URL or
   `OWNER/REPO#N`.
 - `unsubscribe` takes the same `pr` argument and stops watching it.
-- `subscriptions` lists this process's active PRs.
+- `subscriptions` lists this process's active PRs. When any exist, it also
+  returns the Monitor command. It waits up to 30 seconds for startup discovery
+  to finish.
 - `pending_events` returns unread events and reports any events dropped at the
   queue limit.
 
@@ -87,9 +89,35 @@ after 30 minutes; the expiry also wakes the session, which calls
 `pending_events` and starts the monitor again. The wake line is only a signal:
 `pending_events` remains the durable read path.
 
-Subscriptions and unread events live in memory. They end with the stdio server
-process. A restarted session must subscribe again. Channel delivery is best
-effort. The pending queue holds up to 1,000 events; `pending_events` reports
+## Restarted sessions
+
+Subscriptions and unread events live in memory, and they end with the stdio
+server process. A resumed or restarted Claude Code session starts a new
+process. That process has no subscriptions, and the monitor that was tailing
+the old wake file is gone.
+
+On startup the server rediscovers the PRs that the session most plausibly owns.
+Nothing is written to disk. In the background, it finds the git checkout of the
+project directory and reads the GitHub repositories named by its remotes. It
+then subscribes to every open PR by the token's owner in one of those
+repositories whose head branch exists as a local branch. Branches in other
+worktrees of the same repository count. Each PR gets the normal baseline, so
+old activity is not replayed. The server instructions tell the model to call
+`subscriptions` at the start of a session. If anything is listed, the model
+starts the Monitor command that the result names.
+
+The project directory is `CLAUDE_PROJECT_DIR`, then `PWD`, then the working
+directory. Claude Code sets `CLAUDE_PROJECT_DIR` for stdio servers. The
+working directory alone does not identify the project:
+`uv run --directory /path/to/checkout` moves it to the ghark checkout.
+Discovery is best effort. Failures are logged, and the server serves without
+the missing subscriptions. Set `GHARK_DISCOVER=0` to turn it off.
+
+Two sessions in the same repository both discover the same PRs. Each session
+wakes on review of the other session's PRs. Set `GHARK_DISCOVER=0` for one of
+the sessions, or `unsubscribe` PRs that the session does not own.
+
+Channel delivery is best effort. The pending queue holds up to 1,000 events; `pending_events` reports
 how many older events were dropped when that limit was reached.
 
 ## Hooks
@@ -181,7 +209,7 @@ uv run python -m unittest discover -s tests -v
 
 Set `GHARK_POLL_SECONDS` to change the polling interval. The default is 30
 seconds. Set `GHARK_BATCH_SECONDS` to change the event coalescing window. The
-default is 5 seconds.
+default is 5 seconds. Set `GHARK_DISCOVER=0` to disable startup discovery.
 
 The server logs to stderr and to `~/.local/state/ghark/ghark.log` (or
 `$XDG_STATE_HOME/ghark/ghark.log`). Set `GHARK_LOG_FILE` to change the path.
