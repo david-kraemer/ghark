@@ -92,13 +92,20 @@ process. A restarted session must subscribe again. Channel delivery is best
 effort. The pending queue holds up to 1,000 events; `pending_events` reports
 how many older events were dropped when that limit was reached.
 
-### Signature hook
+## Hooks
 
-An unsigned reply from Claude counts as a review request, and Claude may then
-reply to its own comment in a loop. The `ghark-hook-signature` PreToolUse hook
-denies Bash commands that post an unsigned comment. It tells Claude to append
-the signature line and retry. Add it to `~/.claude/settings.json` or to a
-project's `.claude/settings.json`:
+Two Claude Code hooks back up the server instructions. The model can forget
+either rule, and nothing reports the miss.
+
+- `ghark-hook-signature` (PreToolUse) denies Bash commands that post an
+  unsigned PR comment or review. An unsigned reply from Claude counts as a
+  review request, so Claude could wake itself and reply to its own comment in
+  a loop. The denial tells Claude to append the signature line and retry.
+- `ghark-hook-subscribe` (PostToolUse) runs after a successful `gh pr create`
+  (or `gh pr new`). It tells Claude to call `subscribe` with the URL the
+  command printed and to start the Monitor the result names.
+
+Add them to `~/.claude/settings.json` or to a project's `.claude/settings.json`:
 
 ```json
 {
@@ -109,7 +116,21 @@ project's `.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
+            "if": "Bash(gh *)",
             "command": "uv run --directory /path/to/checkout ghark-hook-signature",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(gh *)",
+            "command": "uv run --directory /path/to/checkout ghark-hook-subscribe",
             "timeout": 30
           }
         ]
@@ -119,7 +140,10 @@ project's `.claude/settings.json`:
 }
 ```
 
-The hook checks these commands:
+The `if` filter starts the hooks only for `gh` commands, including each
+command in a `&&` chain.
+
+The signature hook checks these commands:
 
 - `gh pr comment`, `gh pr review`, and `gh issue comment` with `--body`/`-b`
   or `--body-file`/`-F`
@@ -127,11 +151,14 @@ The hook checks these commands:
   `…/replies` with `body` or `…[body]` fields, `-F body=@file`, or `--input`
 - `gh api graphql` comment and review mutations
 
-The hook reads body files relative to the session's working directory. It
-allows any body it cannot read with confidence: a shell variable, a command
+It reads body files relative to the session's working directory. It allows
+any body it cannot read with confidence: a shell variable, a command
 substitution, a pipe into `-F -`, a file the same command writes first, or a
 command the shell lexer cannot parse. A false block stalls work; a rare miss
 costs one extra wake-up.
+
+The subscribe hook covers PRs created during a session, not PRs opened before
+it started.
 
 ## Development
 
