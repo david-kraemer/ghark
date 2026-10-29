@@ -12,6 +12,7 @@ import httpx
 
 from .models import (
     ActivityKind,
+    AuthoredPullRequest,
     Baseline,
     CheckState,
     Mergeability,
@@ -71,6 +72,21 @@ class GitHubClient:
         """Read the login of the token's owner."""
         data = await self._graphql("query { viewer { login } }", {})
         return data["viewer"]["login"]
+
+    async def viewer_pull_requests(self) -> tuple[AuthoredPullRequest, ...]:
+        """Read every open pull request authored by the token's owner."""
+        authored: list[AuthoredPullRequest] = []
+        variables: dict[str, Any] = {"after": None}
+        while True:
+            data = await self._graphql(_VIEWER_PULL_REQUESTS_QUERY, variables)
+            connection = data["viewer"]["pullRequests"]
+            authored.extend(
+                _authored_pull_request(node) for node in connection["nodes"] if node
+            )
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                return tuple(authored)
+            variables["after"] = page_info["endCursor"]
 
     async def baseline(self, pr: PullRequestRef) -> Baseline:
         """Read the initial snapshot and timeline cursor for a subscription."""
@@ -345,3 +361,29 @@ def _pr_from_data(data: dict[str, Any], pr: PullRequestRef) -> dict[str, Any]:
     if record is None:
         raise GitHubError(f"Pull request not found: {pr}")
     return record
+
+
+_VIEWER_PULL_REQUESTS_QUERY = """
+query ViewerPullRequests($after: String) {
+  viewer {
+    pullRequests(states: OPEN, first: 100, after: $after) {
+      nodes {
+        number
+        headRefName
+        repository { name owner { login } }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+
+def _authored_pull_request(node: dict[str, Any]) -> AuthoredPullRequest:
+    repository = node["repository"]
+    return AuthoredPullRequest(
+        pr=PullRequestRef(
+            repository["owner"]["login"], repository["name"], node["number"]
+        ),
+        head_branch=node["headRefName"],
+    )

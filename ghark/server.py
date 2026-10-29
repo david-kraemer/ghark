@@ -20,6 +20,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 
 from .channel import ClaudeChannel
 from .config import Settings, ghark_log_file, ghark_wake_file, settings_from_env
+from .discovery import owned_pull_requests
 from .github import GitHubClient, GitHubError
 from .models import PullRequestRef
 from .session import SessionState
@@ -29,6 +30,9 @@ __all__ = ["create_server", "serve", "main"]
 
 __version__ = "0.1.0"
 
+#: How long the subscriptions tool waits for startup discovery to finish.
+DISCOVERY_WAIT_SECONDS = 30
+
 logger = logging.getLogger("ghark")
 
 SERVER_INSTRUCTIONS = """
@@ -37,9 +41,15 @@ comments without waiting to be asked. Subscribe to each pull request right
 after you create it.
 
 The subscribe result names a Monitor command. Start it once with the maximum
-timeout, unless it is already running. Each line it prints means new review
-requests. When a line arrives or the monitor expires, call pending_events,
-then start the monitor again.
+timeout, unless a monitor with that exact command is already running. Each line
+it prints means new review requests. When a line arrives or the monitor
+expires, call pending_events, then start the monitor again.
+
+The server restarts with every session, including a resumed one, and monitors
+from before the restart have stopped. On startup it subscribes to your open
+pull requests whose branches exist in this project's repository. At the start
+of a session, call subscriptions; if it lists any pull request, start the
+Monitor command it names.
 
 Events marked actionable are review requests from the reviewer. Address each
 one: change the code, push, and reply on the pull request. End every comment
@@ -119,10 +129,20 @@ def create_server(
         batch_window=settings.batch_window,
     )
 
+    discovered = anyio.Event()
+
+    async def discover() -> None:
+        try:
+            if settings.discover:
+                await _discover(settings.project_dir, state, github, wake_file)
+        finally:
+            discovered.set()
+
     @contextlib.asynccontextmanager
     async def lifespan(_: Server) -> AsyncIterator[None]:
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(poller.run)
+            tasks.start_soon(discover)
             try:
                 yield
             finally:
@@ -151,7 +171,9 @@ def create_server(
                 case ToolName.UNSUBSCRIBE:
                     return _unsubscribe(arguments["pr"], state)
                 case ToolName.SUBSCRIPTIONS:
-                    return _subscriptions(state)
+                    with anyio.move_on_after(DISCOVERY_WAIT_SECONDS):
+                        await discovered.wait()
+                    return _subscriptions(state, wake_file)
                 case ToolName.PENDING_EVENTS:
                     return _pending_events(state)
         except (ValueError, GitHubError) as exc:
@@ -205,8 +227,37 @@ def _unsubscribe(pr_input: str, state: SessionState) -> dict[str, str]:
     }
 
 
-def _subscriptions(state: SessionState) -> dict[str, list[dict[str, str]]]:
-    return {"subscriptions": [watch.as_dict() for watch in state.subscriptions()]}
+def _subscriptions(state: SessionState, wake_file: pathlib.Path) -> dict[str, Any]:
+    """List the watches, and the Monitor command whenever there are any."""
+    watches = [watch.as_dict() for watch in state.subscriptions()]
+    if not watches:
+        return {"subscriptions": watches}
+    return {"subscriptions": watches, "monitor": _monitor(wake_file)}
+
+
+async def _discover(
+    project_dir: pathlib.Path,
+    state: SessionState,
+    github: GitHubClient,
+    wake_file: pathlib.Path,
+) -> None:
+    """Subscribe to the open PRs this session most plausibly owns.
+
+    Best effort: every failure is logged, none is raised, so the server keeps
+    serving whatever was found.
+    """
+    try:
+        prs = await owned_pull_requests(project_dir, github)
+    except Exception as exc:
+        logger.warning("Discovery skipped in %s: %s", project_dir, exc)
+        return
+    for pr in prs:
+        try:
+            await _subscribe(str(pr), state, github, wake_file)
+        except Exception:
+            logger.exception("Discovery could not subscribe to %s", pr)
+    subscribed = ", ".join(str(watch.pr) for watch in state.subscriptions())
+    logger.info("Discovery in %s found %d PR(s): %s", project_dir, len(prs), subscribed)
 
 
 def _pending_events(state: SessionState) -> dict[str, Any]:

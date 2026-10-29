@@ -6,9 +6,11 @@ import datetime
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from collections.abc import Callable
 from typing import Any
 
@@ -22,8 +24,11 @@ from mcp.shared.message import SessionMessage
 from mcp.types import ServerCapabilities
 
 import ghark.channel
+import ghark.config
+import ghark.discovery
 import ghark.github
 import ghark.models
+import ghark.server
 import ghark.session
 import ghark.watcher
 
@@ -505,6 +510,129 @@ class PollerWakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(wake_file.exists())
 
 
+class DiscoveryConfigTests(unittest.TestCase):
+    def test_discover_is_on_unless_disabled(self) -> None:
+        for value, expected in [("", True), ("1", True), ("0", False), ("Off", False)]:
+            with unittest.mock.patch.dict(os.environ, {"GHARK_DISCOVER": value}):
+                self.assertIs(ghark.config.ghark_discover(), expected, value)
+
+    def test_project_dir_prefers_claude_then_pwd(self) -> None:
+        env = {"CLAUDE_PROJECT_DIR": "/claude", "PWD": "/pwd"}
+        with unittest.mock.patch.dict(os.environ, env):
+            self.assertEqual(ghark.config.ghark_project_dir(), pathlib.Path("/claude"))
+            del os.environ["CLAUDE_PROJECT_DIR"]
+            self.assertEqual(ghark.config.ghark_project_dir(), pathlib.Path("/pwd"))
+            del os.environ["PWD"]
+            self.assertEqual(ghark.config.ghark_project_dir(), pathlib.Path.cwd())
+
+    def test_github_repository_from_remote_urls(self) -> None:
+        repository = ghark.discovery.github_repository
+        self.assertEqual(repository("git@github.com:Owner/repo.git"), "owner/repo")
+        self.assertEqual(repository("https://github.com/owner/re.po"), "owner/re.po")
+        self.assertEqual(repository("ssh://git@github.com/owner/repo/"), "owner/repo")
+        self.assertIsNone(repository("https://gitlab.com/owner/repo.git"))
+
+
+class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    """Discover PRs from a real git checkout and a mocked GitHub."""
+
+    AUTHORED = [
+        ("owner", "repo", 1, "feature-a"),  # Local branch, origin remote.
+        ("owner", "repo", 2, "gone"),  # No local branch.
+        ("other", "repo", 3, "feature-a"),  # Not a remote of the checkout.
+        ("upstream", "repo", 4, "feature-b"),  # Local branch, upstream remote.
+    ]
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.repo = pathlib.Path(directory.name)
+        _git(self.repo, "init", "--quiet", "--initial-branch=main")
+        _git(self.repo, "commit", "--quiet", "--allow-empty", "-m", "init")
+        _git(self.repo, "branch", "feature-a")
+        _git(self.repo, "branch", "feature-b")
+        _git(self.repo, "remote", "add", "origin", "git@github.com:owner/repo.git")
+        _git(self.repo, "remote", "add", "upstream", "https://github.com/Upstream/repo")
+        _git(self.repo, "remote", "add", "mirror", "https://gitlab.com/owner/repo")
+
+    async def test_owned_pull_requests_match_remote_and_branch(self) -> None:
+        github = await _mock_client(_discovery_responder(self.AUTHORED))
+        self.addAsyncCleanup(github.close)
+
+        owned = await ghark.discovery.owned_pull_requests(self.repo, github)
+
+        self.assertEqual([str(pr) for pr in owned], ["owner/repo#1", "upstream/repo#4"])
+
+    async def test_discover_subscribes_with_baseline_and_names_monitor(self) -> None:
+        requests: list[str] = []
+        github = await _mock_client(_discovery_responder(self.AUTHORED, requests))
+        self.addAsyncCleanup(github.close)
+        state = ghark.session.SessionState()
+        wake_file = self.repo / "1.wake"
+
+        await ghark.server._discover(self.repo, state, github, wake_file)
+        listed = ghark.server._subscriptions(state, wake_file)
+
+        self.assertEqual(
+            [watch.pr for watch in state.subscriptions()],
+            [
+                ghark.models.PullRequestRef("owner", "repo", 1),
+                ghark.models.PullRequestRef("upstream", "repo", 4),
+            ],
+        )
+        self.assertEqual(state.subscriptions()[0].timeline_cursor, "cursor-1")
+        self.assertEqual(state.reviewers, frozenset({"me"}))
+        self.assertEqual(listed["monitor"], ghark.server._monitor(wake_file))
+        self.assertEqual(requests.count("ViewerPullRequests"), 1)
+        self.assertEqual(state.flush_pending().events, ())
+
+    async def test_discover_logs_and_continues_outside_a_checkout(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        github = await _mock_client(_discovery_responder(self.AUTHORED))
+        self.addAsyncCleanup(github.close)
+        state = ghark.session.SessionState()
+
+        with self.assertLogs("ghark", "WARNING") as logs:
+            await ghark.server._discover(
+                pathlib.Path(directory.name), state, github, self.repo / "1.wake"
+            )
+
+        self.assertEqual(state.subscriptions(), ())
+        self.assertIn("Discovery skipped", logs.output[0])
+        self.assertNotIn("monitor", ghark.server._subscriptions(state, self.repo))
+
+    async def test_discover_logs_and_continues_on_github_failure(self) -> None:
+        github = await _mock_client(lambda _: httpx.Response(502))
+        self.addAsyncCleanup(github.close)
+        state = ghark.session.SessionState()
+
+        with self.assertLogs("ghark", "WARNING") as logs:
+            await ghark.server._discover(self.repo, state, github, self.repo / "w")
+
+        self.assertEqual(state.subscriptions(), ())
+        self.assertIn("502", logs.output[0])
+
+    async def test_one_failed_baseline_does_not_stop_the_others(self) -> None:
+        responder = _discovery_responder(self.AUTHORED)
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            if json.loads(request.read())["variables"].get("number") == 1:
+                return httpx.Response(500)
+            return responder(request)
+
+        github = await _mock_client(respond)
+        self.addAsyncCleanup(github.close)
+        state = ghark.session.SessionState()
+
+        with self.assertLogs("ghark", "ERROR"):
+            await ghark.server._discover(self.repo, state, github, self.repo / "w")
+
+        self.assertEqual(
+            [str(watch.pr) for watch in state.subscriptions()], ["upstream/repo#4"]
+        )
+
+
 class ClaudeChannelTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_writes_channel_notification(self) -> None:
         pr = ghark.models.PullRequestRef("owner", "repo", 12)
@@ -540,11 +668,17 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
         log_dir = tempfile.TemporaryDirectory()
         self.addCleanup(log_dir.cleanup)
         log_file = pathlib.Path(log_dir.name) / "ghark.log"
+        # Discovery runs in a directory that is not a checkout: it must fail
+        # quietly, before any GitHub request, and leave the tools serving.
         parameters = StdioServerParameters(
             command=sys.executable,
             args=["-m", "ghark"],
             env=os.environ
-            | {"GH_TOKEN": "test-token", "GHARK_LOG_FILE": str(log_file)},
+            | {
+                "GH_TOKEN": "test-token",
+                "GHARK_LOG_FILE": str(log_file),
+                "CLAUDE_PROJECT_DIR": log_dir.name,
+            },
             cwd=str(pathlib.Path.cwd()),
         )
         async with asyncio.timeout(15):
@@ -572,6 +706,7 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(log_file.parent.glob("*.wake")), [])
         log = log_file.read_text()
         self.assertIn("ghark 0.1.0 started", log)
+        self.assertIn(f"Discovery skipped in {log_dir.name}", log)
         self.assertIn("Client closed the connection; shutting down.", log)
         self.assertTrue(log.rstrip().endswith("ghark stopped."))
 
@@ -593,6 +728,46 @@ async def _mock_client(
         base_url="https://api.github.com",
     )
     return client
+
+
+def _git(directory: pathlib.Path, *args: str) -> None:
+    identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"]
+    subprocess.run(["git", "-C", str(directory), *identity, *args], check=True)
+
+
+def _discovery_responder(
+    authored: list[tuple[str, str, int, str]], requests: list[str] | None = None
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Answer the viewer, viewer-PR and baseline queries."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        query = json.loads(request.read())["query"]
+        if "ViewerPullRequests" in query:
+            name = "ViewerPullRequests"
+            nodes = [
+                {
+                    "number": number,
+                    "headRefName": branch,
+                    "repository": {"name": repo, "owner": {"login": owner}},
+                }
+                for owner, repo, number, branch in authored
+            ]
+            page = {"nodes": nodes, "pageInfo": {"hasNextPage": False}}
+            data: dict[str, Any] = {"viewer": {"pullRequests": page}}
+        elif "viewer" in query:
+            name = "viewer"
+            data = {"viewer": {"login": "Me"}}
+        else:
+            name = "PullRequest"
+            pr_record = _pr_payload(
+                timeline_items={"pageInfo": {"endCursor": "cursor-1"}}
+            )
+            data = {"repository": {"pullRequest": pr_record}}
+        if requests is not None:
+            requests.append(name)
+        return httpx.Response(200, json={"data": data})
+
+    return respond
 
 
 def _event(kind: str, body: str, actor: str = "") -> ghark.models.ActivityEvent:
