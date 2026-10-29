@@ -92,6 +92,47 @@ process. A restarted session must subscribe again. Channel delivery is best
 effort. The pending queue holds up to 1,000 events; `pending_events` reports
 how many older events were dropped when that limit was reached.
 
+### Signature hook
+
+An unsigned reply from Claude counts as a review request, and Claude may then
+reply to its own comment in a loop. The `ghark-hook-signature` PreToolUse hook
+denies Bash commands that post an unsigned comment. It tells Claude to append
+the signature line and retry. Add it to `~/.claude/settings.json` or to a
+project's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --directory /path/to/checkout ghark-hook-signature",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook checks these commands:
+
+- `gh pr comment`, `gh pr review`, and `gh issue comment` with `--body`/`-b`
+  or `--body-file`/`-F`
+- `gh api` POSTs to `…/comments`, `…/reviews`, `…/reviews/N/events`, and
+  `…/replies` with `body` or `…[body]` fields, `-F body=@file`, or `--input`
+- `gh api graphql` comment and review mutations
+
+The hook reads body files relative to the session's working directory. It
+allows any body it cannot read with confidence: a shell variable, a command
+substitution, a pipe into `-F -`, a file the same command writes first, or a
+command the shell lexer cannot parse. A false block stalls work; a rare miss
+costs one extra wake-up.
+
 ## Development
 
 ```sh
