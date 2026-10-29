@@ -19,6 +19,7 @@ dev = ["ruff>=0.12"]
 
 [project.scripts]
 ghark = "ghark.server:main"
+ghark-hook-subscribe = "ghark.hooks:subscribe_hook_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ghark"]

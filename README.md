@@ -92,6 +92,42 @@ process. A restarted session must subscribe again. Channel delivery is best
 effort. The pending queue holds up to 1,000 events; `pending_events` reports
 how many older events were dropped when that limit was reached.
 
+## Subscribe hook
+
+The server instructions ask Claude to subscribe after it opens a PR, but a
+model can forget. The `ghark-hook-subscribe` command is a Claude Code
+`PostToolUse` hook that backs this up. After a successful Bash call that ran
+`gh pr create`, it adds context telling Claude to call `subscribe` with the PR
+URL from the command's stdout, and to start the Monitor the result names. If
+stdout has no PR URL, the reminder asks Claude to subscribe to the PR it just
+created. Failed runs and other commands produce no output.
+
+Add it to `~/.claude/settings.json` or a project's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(gh pr create*)",
+            "command": "uv run --directory /path/to/checkout ghark-hook-subscribe",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The `if` filter keeps the hook from starting on other Bash calls. The hook
+covers PRs created during a session; it does not find PRs opened before the
+session started.
+
 ## Development
 
 ```sh
