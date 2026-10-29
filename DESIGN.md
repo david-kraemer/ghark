@@ -120,13 +120,14 @@ starts after initialization, so initialization does not wait for it.
    (`roots/list`) would also give the launch directory. They need a client
    round trip after initialization, and the environment variable already
    answers the question for Claude Code.
-2. It runs `git remote -v` and `git for-each-ref refs/heads/` in that
+2. It runs `git remote -v` and `git branch --show-current` in that
    directory, with stdin closed, because stdin carries the MCP transport. It
    keeps the remotes on `github.com`.
 3. It makes one paginated GraphQL query for the viewer's open PRs. It keeps the
    PRs whose repository matches a remote, ignoring case, and whose head branch
-   is a local branch. Branches are shared across worktrees, so a PR opened from
-   an agent's worktree branch counts.
+   is the checked-out branch. Matching every local branch subscribed each spade
+   session to ten open PRs, some long idle, so every review would have woken
+   every session in the repository.
 4. It subscribes to each matching PR through the same path as the `subscribe`
    tool, which sets the baseline and resolves the default reviewer.
 
@@ -170,7 +171,7 @@ discovery is still running.
 - The unread queue holds up to 1,000 events. If it fills, the server drops the
   oldest events and reports the dropped count through `pending_events`.
 - State is local to a running process. Restarting loses unread events.
-  Subscriptions are rediscovered only for open PRs whose branches are local.
+  Subscriptions are rediscovered only for the open PR of the checked-out branch.
 - MCP clients may not keep a server's stderr after startup, so the server
   also logs to a file and records its exit reason there. An exception that
   escapes the poller task ends the process; channel delivery therefore never

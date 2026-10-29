@@ -100,8 +100,11 @@ On startup the server rediscovers the PRs that the session most plausibly owns.
 Nothing is written to disk. In the background, it finds the git checkout of the
 project directory and reads the GitHub repositories named by its remotes. It
 then subscribes to every open PR by the token's owner in one of those
-repositories whose head branch exists as a local branch. Branches in other
-worktrees of the same repository count. Each PR gets the normal baseline, so
+repositories whose head branch is the checked-out branch. Other local branches
+are ignored: in a busy repository they name many PRs, some stale, and every
+session would wake on every review. A session in a worktree finds the main
+checkout's branch, since `CLAUDE_PROJECT_DIR` names the main checkout; the
+subscribe hook covers PRs it opens. Each PR gets the normal baseline, so
 old activity is not replayed. The server instructions tell the model to call
 `subscriptions` at the start of a session. If anything is listed, the model
 starts the Monitor command that the result names.

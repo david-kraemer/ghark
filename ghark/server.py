@@ -47,7 +47,7 @@ expires, call pending_events, then start the monitor again.
 
 The server restarts with every session, including a resumed one, and monitors
 from before the restart have stopped. On startup it subscribes to your open
-pull requests whose branches exist in this project's repository. At the start
+pull request for the branch checked out in this project's repository. At the start
 of a session, call subscriptions; if it lists any pull request, start the
 Monitor command it names.
 

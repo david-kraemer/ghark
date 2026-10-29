@@ -623,10 +623,11 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
     """Discover PRs from a real git checkout and a mocked GitHub."""
 
     AUTHORED = [
-        ("owner", "repo", 1, "feature-a"),  # Local branch, origin remote.
+        ("owner", "repo", 1, "feature-a"),  # Checked out, origin remote.
         ("owner", "repo", 2, "gone"),  # No local branch.
         ("other", "repo", 3, "feature-a"),  # Not a remote of the checkout.
-        ("upstream", "repo", 4, "feature-b"),  # Local branch, upstream remote.
+        ("upstream", "repo", 4, "feature-a"),  # Checked out, upstream remote.
+        ("owner", "repo", 5, "feature-b"),  # Local but not checked out.
     ]
 
     def setUp(self) -> None:
@@ -637,6 +638,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         _git(self.repo, "commit", "--quiet", "--allow-empty", "-m", "init")
         _git(self.repo, "branch", "feature-a")
         _git(self.repo, "branch", "feature-b")
+        _git(self.repo, "checkout", "--quiet", "feature-a")
         _git(self.repo, "remote", "add", "origin", "git@github.com:owner/repo.git")
         _git(self.repo, "remote", "add", "upstream", "https://github.com/Upstream/repo")
         _git(self.repo, "remote", "add", "mirror", "https://gitlab.com/owner/repo")

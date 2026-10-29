@@ -3,8 +3,10 @@
 Subscriptions live in process memory, so a resumed session starts with none.
 The project's git checkout is the only durable record of what the session
 worked on: a pull request is claimed when the token's owner authored it, its
-repository is one of the checkout's GitHub remotes, and its head branch exists
-locally.
+repository is one of the checkout's GitHub remotes, and its head branch is the
+branch checked out there. Matching every local branch instead would hand each
+session in a busy repository every open PR, stale ones included, and each
+review comment would wake all of them.
 """
 
 import dataclasses
@@ -27,30 +29,31 @@ __all__ = [
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class LocalCheckout:
-    """The GitHub repositories a checkout's remotes name, and its branches."""
+    """The GitHub repositories a checkout's remotes name, and its branch."""
 
     #: Lowercase ``owner/repo`` names.
     repositories: frozenset[str]
-    branches: frozenset[str]
+    #: Empty when HEAD is detached.
+    branch: str
 
     def owns(self, authored: AuthoredPullRequest) -> bool:
         pr = authored.pr
         return (
             f"{pr.owner}/{pr.repo}".lower() in self.repositories
-            and authored.head_branch in self.branches
+            and authored.head_branch == self.branch
         )
 
 
 async def owned_pull_requests(
     directory: pathlib.Path, github: GitHubClient
 ) -> tuple[PullRequestRef, ...]:
-    """Open PRs by the viewer whose repository and head branch are local.
+    """Open PRs by the viewer from the checked-out branch of a local remote.
 
     Raises when ``directory`` is not a git checkout or GitHub cannot be read;
     the caller decides how to fail.
     """
     checkout = await local_checkout(directory)
-    if not checkout.repositories or not checkout.branches:
+    if not checkout.repositories or not checkout.branch:
         return ()
     authored = await github.viewer_pull_requests()
     owned = {pr.pr for pr in authored if checkout.owns(pr)}
@@ -58,11 +61,9 @@ async def owned_pull_requests(
 
 
 async def local_checkout(directory: pathlib.Path) -> LocalCheckout:
-    """Read the GitHub remotes and local branch names of a git checkout."""
+    """Read the GitHub remotes and checked-out branch of a git checkout."""
     remotes = await _git(directory, "remote", "-v")
-    branches = await _git(
-        directory, "for-each-ref", "--format=%(refname:short)", "refs/heads/"
-    )
+    branch = await _git(directory, "branch", "--show-current")
     urls = (line.split()[1] for line in remotes.splitlines() if line.strip())
     return LocalCheckout(
         repositories=frozenset(
@@ -70,7 +71,7 @@ async def local_checkout(directory: pathlib.Path) -> LocalCheckout:
             for url in urls
             if (repository := github_repository(url)) is not None
         ),
-        branches=frozenset(branches.split()),
+        branch=branch.strip(),
     )
 
 
