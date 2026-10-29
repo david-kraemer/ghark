@@ -243,6 +243,37 @@ class SessionStateTests(unittest.TestCase):
         self.assertEqual([event.actor for event in reported], ["alice"])
         self.assertEqual([event.actor for event in repeated], ["bob"])
 
+    def test_comment_from_review_pending_at_subscription_is_reported(self) -> None:
+        pr = ghark.models.PullRequestRef("owner", "repo", 12)
+        snapshot = _snapshot()
+        cursor = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+        state = ghark.session.SessionState()
+        state.subscribe(
+            pr,
+            ghark.models.Baseline(
+                snapshot, None, cursor, pending_review_ids=frozenset({50})
+            ),
+        )
+        watch = state.watch(pr)
+        assert watch is not None
+        before = cursor - datetime.timedelta(seconds=10)
+        result = ghark.models.PollResult(
+            snapshot=snapshot,
+            timeline_cursor=None,
+            review_cursor=cursor + datetime.timedelta(seconds=30),
+            timeline_entries=(),
+            review_comments=(
+                # Drafted in a review that was pending at subscription.
+                ghark.models.ReviewComment(1, before, "Drafted.", "alice", 50),
+                # An edit to a comment from a review submitted earlier.
+                ghark.models.ReviewComment(2, before, "Edited.", "alice", 40),
+            ),
+        )
+
+        events = state.record_poll(watch, result)
+
+        self.assertEqual([event.summary for event in events], ["Drafted."])
+
 
 class GitHubClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_baseline_and_observation_over_mock_http(self) -> None:
@@ -408,6 +439,61 @@ class RecordedGitHubTests(unittest.IsolatedAsyncioTestCase):
             return await client.observation(watch)
         finally:
             await client.close()
+
+
+class RecordedPendingReviewTests(unittest.IsolatedAsyncioTestCase):
+    """Drive a review recorded on david-kraemer/ghark#1.
+
+    The review was started, leaving it pending, before the subscription and
+    submitted after it. Its inline comment predates the subscription.
+    """
+
+    PR = ghark.models.PullRequestRef("david-kraemer", "ghark", 1)
+
+    async def test_review_pending_at_subscription_reports_its_comments(
+        self,
+    ) -> None:
+        def respond(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/graphql":
+                if "PullRequestEvents" in request.read().decode():
+                    return httpx.Response(
+                        200, json=_fixture("david_kraemer_ghark_1_events.json")
+                    )
+                return httpx.Response(
+                    200, json=_fixture("david_kraemer_ghark_1_baseline.json")
+                )
+            return httpx.Response(
+                200, json=_fixture("david_kraemer_ghark_1_review_comments.json")
+            )
+
+        state = ghark.session.SessionState(reviewers=frozenset({"david-kraemer"}))
+        client = await _mock_client(respond)
+        try:
+            baseline = await client.baseline(self.PR)
+            state.subscribe(self.PR, baseline)
+            watch = state.watch(self.PR)
+            assert watch is not None
+            result = await client.observation(watch)
+        finally:
+            await client.close()
+        events = state.record_poll(watch, result)
+
+        self.assertEqual(baseline.pending_review_ids, frozenset({5697166279}))
+        self.assertEqual(
+            [(event.kind, event.summary, event.actionable) for event in events],
+            [
+                (
+                    ghark.models.ActivityKind.REVIEW,
+                    "COMMENTED: Review started before subscription.",
+                    True,
+                ),
+                (
+                    ghark.models.ActivityKind.THREAD_COMMENT,
+                    "Inline comment made before subscription.",
+                    True,
+                ),
+            ],
+        )
 
 
 class ReviewerRequestTests(unittest.TestCase):
@@ -628,4 +714,5 @@ def _pr_payload(*, timeline_items: dict[str, object]) -> dict[str, object]:
         "headRefOid": "abc123",
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
         "timelineItems": timeline_items,
+        "reviews": {"nodes": []},
     }

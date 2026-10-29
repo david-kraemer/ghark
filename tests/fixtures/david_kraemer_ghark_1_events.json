@@ -1,0 +1,40 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "url": "https://github.com/david-kraemer/ghark/pull/1",
+        "title": "ghark scratch: pending review test",
+        "state": "OPEN",
+        "merged": false,
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+        "headRefOid": "3ea11820b0d86b6dd841734f11f6b36107d2170a",
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "statusCheckRollup": null
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "nodes": [
+            {
+              "__typename": "PullRequestReview",
+              "state": "COMMENTED",
+              "body": "Review started before subscription.",
+              "author": {
+                "login": "david-kraemer"
+              }
+            }
+          ],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpPPAAABoYd9JMAFqjU2OTcxNjYyNzk="
+          }
+        }
+      }
+    }
+  }
+}

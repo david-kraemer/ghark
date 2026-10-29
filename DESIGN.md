@@ -74,7 +74,10 @@ token's owner. The session posts with that token, so its own comments carry
 the reviewer's login; the Claude Code signature it appends marks them, and
 signed comments are never actionable. Without that rule each reply would wake
 the session again. A pending review is the viewer's unsubmitted draft and is
-not reported.
+not reported. The timeline cursor may pass it: GitHub orders a review by its
+submission time, so the submitted review appears after the cursor. Its inline
+comments are hidden from the REST comment list until submission, which sets
+their `updated_at` to the submission time.
 
 ## Delivery
 
@@ -104,6 +107,9 @@ events stay queued, so the next wake recovers them.
   from silently dropping activity. The REST review-comment query uses its
   `since` timestamp, which matches edits as well as new comments. Edits to
   comments created before the subscription are filtered by creation time.
+  The exception is a review pending at subscription: the baseline records its
+  ID, and its comments are reported when it is submitted, although they were
+  created earlier.
   Overlap and edits to reported comments are filtered by the seen IDs, which
   last for the life of the watch. Edits are not reported.
 - Review-comment polling uses one REST request per watched PR per poll, plus

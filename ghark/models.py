@@ -203,6 +203,7 @@ class ReviewComment:
     created_at: datetime.datetime
     body: str
     actor: str
+    review_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.comment_id < 1:
@@ -322,6 +323,9 @@ class WatchState:
     review_cursor: datetime.datetime
     subscribed_at: datetime.datetime
     seen_comment_ids: frozenset[int] = frozenset()
+    #: Reviews unsubmitted at subscription. Their comments predate the
+    #: subscription but are new to the session once the review is submitted.
+    pending_review_ids: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         times = (self.review_cursor, self.subscribed_at)
@@ -352,7 +356,10 @@ class WatchState:
                 ActivityEvent.from_review_comment(self.pr, result.snapshot, comment)
                 for comment in result.review_comments
                 if comment.comment_id not in self.seen_comment_ids
-                and comment.created_at >= self.subscribed_at
+                and (
+                    comment.created_at >= self.subscribed_at
+                    or comment.review_id in self.pending_review_ids
+                )
             ),
         )
         return (event.for_reviewers(reviewers) for event in entries)
@@ -381,6 +388,7 @@ class Baseline:
     snapshot: PullRequestSnapshot
     timeline_cursor: str | None
     review_cursor: datetime.datetime
+    pending_review_ids: frozenset[int] = frozenset()
 
     def watch(self, pr: PullRequestRef) -> WatchState:
         return WatchState(
@@ -389,6 +397,7 @@ class Baseline:
             timeline_cursor=self.timeline_cursor,
             review_cursor=self.review_cursor,
             subscribed_at=self.review_cursor,
+            pending_review_ids=self.pending_review_ids,
         )
 
 

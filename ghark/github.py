@@ -81,6 +81,9 @@ class GitHubClient:
             snapshot=_snapshot(record),
             timeline_cursor=record["timelineItems"]["pageInfo"].get("endCursor"),
             review_cursor=review_cursor,
+            pending_review_ids=frozenset(
+                int(node["fullDatabaseId"]) for node in record["reviews"]["nodes"]
+            ),
         )
 
     async def observation(self, watch: WatchState) -> PollResult:
@@ -192,6 +195,7 @@ query PullRequest($owner: String!, $name: String!, $number: Int!) {{
     pullRequest(number: $number) {{
 {_PULL_REQUEST_FIELDS}
       timelineItems(last: 1) {{ pageInfo {{ endCursor }} }}
+      reviews(states: [PENDING], first: 10) {{ nodes {{ fullDatabaseId }} }}
     }}
   }}
 }}
@@ -278,6 +282,10 @@ def _timeline_entries(nodes: list[dict[str, Any]]) -> tuple[TimelineEntry, ...]:
 
     A node that cannot be read is logged and skipped rather than failing the
     poll; otherwise the cursor never advances and the PR fails on every poll.
+
+    A pending review is skipped, and the cursor may pass it. GitHub orders a
+    review by its submission time, so the submitted review appears again after
+    the cursor.
     """
     entries: list[TimelineEntry] = []
     for node in nodes:
@@ -337,6 +345,7 @@ def _review_comment(record: dict[str, Any]) -> ReviewComment:
         ),
         body=record.get("body", ""),
         actor=(record.get("user") or {}).get("login", ""),
+        review_id=record.get("pull_request_review_id"),
     )
 
 
