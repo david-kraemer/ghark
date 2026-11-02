@@ -1,4 +1,12 @@
-# ghark
+<p align="center">
+  <img src="assets/ghark-logo.png" alt="ghark logo" width="160">
+</p>
+
+<h1 align="center">ghark</h1>
+
+<p align="center">
+  A local MCP server that wakes your coding session when a pull request needs a response.
+</p>
 
 `ghark` lets a Claude Code session respond to review on the pull requests it
 opens. When the reviewer comments, the session wakes, makes the changes,
