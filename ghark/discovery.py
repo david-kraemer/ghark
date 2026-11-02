@@ -12,11 +12,8 @@ review comment would wake all of them.
 import dataclasses
 import pathlib
 import re
-import subprocess
 
-import anyio
-
-from .github import GitHubClient
+from .github import GitHubClient, git_branch, git_remote_urls
 from .models import AuthoredPullRequest, PullRequestRef
 
 __all__ = [
@@ -62,16 +59,14 @@ async def owned_pull_requests(
 
 async def local_checkout(directory: pathlib.Path) -> LocalCheckout:
     """Read the GitHub remotes and checked-out branch of a git checkout."""
-    remotes = await _git(directory, "remote", "-v")
-    branch = await _git(directory, "branch", "--show-current")
-    urls = (line.split()[1] for line in remotes.splitlines() if line.strip())
+    urls = await git_remote_urls(directory)
     return LocalCheckout(
         repositories=frozenset(
             repository
             for url in urls
             if (repository := github_repository(url)) is not None
         ),
-        branch=branch.strip(),
+        branch=await git_branch(directory),
     )
 
 
@@ -80,22 +75,6 @@ def github_repository(url: str) -> str | None:
     match = _GITHUB_REMOTE.search(url.strip())
     return f"{match['owner']}/{match['repo']}".lower() if match else None
 
-
-async def _git(directory: pathlib.Path, *args: str) -> str:
-    # stdin is the MCP transport; the child must not inherit it.
-    with anyio.fail_after(_GIT_TIMEOUT_SECONDS):
-        result = await anyio.run_process(
-            ["git", "-C", str(directory), *args],
-            stdin=subprocess.DEVNULL,
-            check=False,
-        )
-    if result.returncode:
-        detail = result.stderr.decode(errors="replace").strip()
-        raise RuntimeError(f"git {args[0]} failed in {directory}: {detail}")
-    return result.stdout.decode(errors="replace")
-
-
-_GIT_TIMEOUT_SECONDS = 10
 
 # git@github.com:o/r.git, ssh://git@github.com/o/r, https://github.com/o/r.git
 _GITHUB_REMOTE = re.compile(

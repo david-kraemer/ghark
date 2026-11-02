@@ -5,9 +5,11 @@ import datetime
 import enum
 import logging
 import os
+import pathlib
 import subprocess
 from typing import Any, TypeVar
 
+import anyio
 import httpx
 
 from .models import (
@@ -26,7 +28,14 @@ from .models import (
     WatchState,
 )
 
-__all__ = ["GitHubClient", "GitHubError", "github_token"]
+__all__ = [
+    "GitHubClient",
+    "GitHubError",
+    "git",
+    "git_branch",
+    "git_remote_urls",
+    "github_token",
+]
 
 logger = logging.getLogger("ghark")
 
@@ -188,6 +197,33 @@ def gh_auth_token() -> str:
     return gh("auth", "token")
 
 
+async def git(directory: pathlib.Path, *args: str) -> str:
+    """Run git in ``directory`` and return its stdout; raise if git fails."""
+    # stdin is the MCP transport; the child must not inherit it.
+    with anyio.fail_after(_GIT_TIMEOUT_SECONDS):
+        result = await anyio.run_process(
+            ["git", "-C", str(directory), *args],
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    if result.returncode:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"git {args[0]} failed in {directory}: {detail}")
+    return result.stdout.decode(errors="replace")
+
+
+async def git_remote_urls(directory: pathlib.Path) -> tuple[str, ...]:
+    """The fetch and push URLs of every remote, each once, in git's order."""
+    lines = (await git(directory, "remote", "-v")).splitlines()
+    return tuple(dict.fromkeys(line.split()[1] for line in lines if line.strip()))
+
+
+async def git_branch(directory: pathlib.Path) -> str:
+    """The checked-out branch; empty when HEAD is detached."""
+    return (await git(directory, "branch", "--show-current")).strip()
+
+
+_GIT_TIMEOUT_SECONDS = 10
 _GRAPHQL_URL = "https://api.github.com/graphql"
 _REST_URL = "https://api.github.com"
 _REVIEW_COMMENT_PAGE_SIZE = 100
