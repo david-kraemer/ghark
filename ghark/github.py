@@ -190,7 +190,11 @@ class GitHubClient:
 
 
 def gh(*args: str) -> str:
-    return subprocess.run(["gh", *args], capture_output=True, text=True).stdout.strip()
+    # stdin is the MCP transport; the child must not inherit it.
+    result = subprocess.run(
+        ["gh", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True
+    )
+    return result.stdout.strip()
 
 
 def gh_auth_token() -> str:
