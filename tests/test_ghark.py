@@ -3,15 +3,12 @@
 import asyncio
 import dataclasses
 import datetime
-import fcntl
 import json
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 import unittest
 import unittest.mock
 from collections.abc import Callable
@@ -577,7 +574,7 @@ class PollerWakeTests(unittest.IsolatedAsyncioTestCase):
             github=GitHub(),  # type: ignore[arg-type]
             state=state,
             channel=ghark.channel.ClaudeChannel(),
-            session_id=session,
+            claude_session=session,
             interval=30,
             batch_window=0,
         )
@@ -618,6 +615,21 @@ class PollerWakeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(self.flag.exists())
 
+    async def test_failed_flag_write_is_retried_on_the_next_poll(self) -> None:
+        state = self.subscribed_state()
+        poller = self.poller(state)
+        with (
+            unittest.mock.patch("ghark.watcher.raise_flag", side_effect=OSError),
+            self.assertLogs("ghark", "ERROR"),
+        ):
+            await poller.poll()
+        self.assertFalse(self.flag.exists())
+
+        poller.github = _QuietGitHub()  # type: ignore[assignment]
+        await poller.poll()
+
+        self.assertEqual(self.flag.read_text(), "owner/repo#12\n")
+
     async def test_no_flag_without_requests(self) -> None:
         await self.poller(ghark.session.SessionState()).poll()
 
@@ -626,106 +638,15 @@ class PollerWakeTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_flag_outside_claude_code(self) -> None:
         await self.poller(self.subscribed_state(), session=None).poll()
 
-        self.assertFalse(ghark.wake.state_dir().exists())
+        self.assertFalse(ghark.wake.ghark_state_dir().exists())
 
 
-class WaiterTests(unittest.TestCase):
-    def setUp(self) -> None:
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.env = os.environ | {"XDG_STATE_HOME": directory.name}
-        patcher = unittest.mock.patch.dict(os.environ, self.env)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        ghark.wake.state_dir().mkdir(parents=True)
-
-    def run_hook(self, timeout: str = "86400") -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "import ghark.wake; ghark.wake.wake_hook()",
-                timeout,
-            ],
-            input=json.dumps({"session_id": "s1", "hook_event_name": "SessionStart"}),
-            capture_output=True,
-            text=True,
-            env=self.env,
-            timeout=30,
-        )
-
-    def test_raised_flag_wakes_with_the_prs(self) -> None:
-        ghark.wake.raise_flag("s1", ["owner/repo#12", "owner/repo#13"])
-
-        result = self.run_hook()
-
-        self.assertEqual(result.returncode, ghark.wake.WAKE)
-        self.assertIn("owner/repo#12, owner/repo#13", result.stderr)
-        self.assertIn("pending_events", result.stderr)
-
-    def test_flag_raised_while_waiting_wakes(self) -> None:
-        timer = threading.Timer(1, ghark.wake.raise_flag, ("s1", ["owner/repo#12"]))
-        timer.start()
-        self.addCleanup(timer.cancel)
-
-        result = self.run_hook()
-
-        self.assertEqual(result.returncode, ghark.wake.WAKE)
-        self.assertIn("owner/repo#12", result.stderr)
-
-    def test_waiter_wakes_before_the_hook_timeout(self) -> None:
-        result = self.run_hook(timeout=str(ghark.wake.TIMEOUT_MARGIN))
-
-        self.assertEqual(result.returncode, ghark.wake.WAKE)
-        self.assertIn("re-arm", result.stderr)
-
-    def test_second_waiter_for_a_session_exits_quietly(self) -> None:
-        ghark.wake.raise_flag("s1", ["owner/repo#12"])
-        with (ghark.wake.state_dir() / "s1.waiter").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-
-            result = self.run_hook()
-
-        self.assertEqual(result.returncode, ghark.wake.QUIET)
-        self.assertEqual(result.stderr, "")
-
-    def test_session_id_that_is_not_a_plain_name_exits_quietly(self) -> None:
-        result = subprocess.run(
-            [sys.executable, "-c", "import ghark.wake; ghark.wake.wake_hook()"],
-            input=json.dumps({"session_id": "../escape"}),
-            capture_output=True,
-            text=True,
-            env=self.env,
-            timeout=30,
-        )
-
-        self.assertEqual(result.returncode, ghark.wake.QUIET)
-        self.assertEqual(list(ghark.wake.state_dir().iterdir()), [])
-
-    def test_waiter_exits_quietly_when_an_ancestor_dies(self) -> None:
-        # The shell stands in for Claude Code; the waiter's parent is a
-        # subshell that outlives it, as uv outlives Claude Code.
-        script = (
-            f"({sys.executable} -c 'import ghark.wake; ghark.wake.wake_hook()' "
-            "</dev/null >/dev/null 2>&1 & echo $!; wait) & sleep 30"
-        )
-        shell = subprocess.Popen(
-            ["sh", "-c", script],
-            stdout=subprocess.PIPE,
-            text=True,
-            env=self.env | {"CLAUDE_CODE_SESSION_ID": "s1"},
-        )
-        assert shell.stdout is not None
-        waiter = int(shell.stdout.readline())
-        time.sleep(1)
-        self.assertTrue(ghark.wake._alive(waiter))
-        shell.kill()
-        shell.wait()
-
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and ghark.wake._alive(waiter):
-            time.sleep(0.2)
-        self.assertFalse(ghark.wake._alive(waiter))
+class _QuietGitHub:
+    async def observation(
+        self, watch: ghark.models.WatchState
+    ) -> ghark.models.PollResult:
+        cursor = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+        return ghark.models.PollResult(_snapshot(), "next", cursor, (), ())
 
 
 class DiscoveryConfigTests(unittest.TestCase):

@@ -23,7 +23,7 @@ class PullRequestPoller:
     state: SessionState
     channel: ClaudeChannel
     #: Claude Code session whose waiter to wake; ``None`` outside Claude Code.
-    session_id: str | None
+    claude_session: str | None
     interval: float
     batch_window: float
 
@@ -44,21 +44,25 @@ class PullRequestPoller:
                 batch.extend(self.state.record_poll(watch, result))
             except Exception:
                 logger.exception("Poll failed for %s", watch.pr)
+        if batch and self.batch_window:
+            await asyncio.sleep(self.batch_window)
+        self._flag_review_requests()
         if batch:
-            if self.batch_window:
-                await asyncio.sleep(self.batch_window)
-            self._wake()
             await self.channel.send(tuple(batch))
 
-    def _wake(self) -> None:
+    def _flag_review_requests(self) -> None:
         """Flag the PRs with unread review requests for the session's waiter.
 
-        Checked after the batch window: a drain during it leaves nothing to flag.
+        Runs after every poll, not only one that found events, so a failed
+        write is retried. It follows the batch window: a drain during it leaves
+        nothing to flag.
         """
         prs = self.state.review_requests()
-        if self.session_id is None or not prs:
+        if self.claude_session is None or not prs:
             return
         try:
-            raise_flag(self.session_id, prs)
+            raise_flag(self.claude_session, prs)
         except OSError:
-            logger.exception("Could not raise the review flag for %s", self.session_id)
+            logger.exception(
+                "Could not raise the review flag for %s", self.claude_session
+            )

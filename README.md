@@ -61,8 +61,7 @@ you want to check for activity.
   `OWNER/REPO#N`.
 - `unsubscribe` takes the same `pr` argument and stops watching it.
 - `subscriptions` lists this process's active PRs. It waits up to 30 seconds
-  for startup discovery
-  to finish.
+  for startup discovery to finish.
 - `pending_events` returns unread events and reports any events dropped at the
   queue limit.
 
@@ -87,7 +86,8 @@ review requests are unread, the server keeps a flag file,
 `<state directory>/<session ID>.pending`, naming their PRs; `pending_events`
 removes it. The hook waits for the flag and then wakes Claude, even when the
 session is idle. The flag is only a signal: `pending_events` remains the
-durable read path. A session that is not waiting on review costs nothing.
+durable read path. A session with no review requests costs one model turn a
+day, when the waiter re-arms.
 
 ## Restarted sessions
 
@@ -129,11 +129,12 @@ report the miss.
 - `ghark-hook-wake` (SessionStart and PostToolUse on `pending_events`, both
   `asyncRewake`) waits for review requests and wakes Claude when they arrive.
   It starts with every session and again after every `pending_events` call,
-  so the model never arms it. A second waiter for the same session exits at
-  once and silently. Claude Code kills a hook at its `timeout` without telling
-  Claude, so the waiter wakes Claude a minute before it: about once a day,
-  Claude calls `pending_events`, which arms the next waiter. The waiter exits
-  quietly when the Claude Code process that started it exits.
+  so the model only has to call `pending_events` when woken, as the wake
+  message says. A second waiter for the same session exits at once and
+  silently. Claude Code kills a hook at its `timeout` without telling Claude,
+  so the waiter wakes Claude a few minutes before it: about once a day, Claude
+  calls `pending_events`, which arms the next waiter. The waiter exits quietly
+  five minutes after the session's ghark server is gone.
 
 - `ghark-hook-signature` (PreToolUse) denies Bash commands that post an
   unsigned PR comment or review. An unsigned reply from Claude counts as a

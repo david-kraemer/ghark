@@ -8,11 +8,14 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from typing import Any
 from unittest import mock
 
 import ghark.hooks
+import ghark.models
+import ghark.wake
 
 SIGNED = "Done.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)"
 HEREDOC = """gh pr comment 12 --body "$(cat <<'EOF'
@@ -303,6 +306,150 @@ class SubscribeHookTests(unittest.TestCase):
         self.assertEqual(_run_main("[]"), "")
 
 
+class WakeDecisionTests(unittest.TestCase):
+    def test_flagged_requests_name_their_prs(self) -> None:
+        message = ghark.wake.wake_message("owner/repo#12", overdue=False)
+
+        assert message is not None
+        self.assertIn("owner/repo#12", message)
+        self.assertIn("pending_events", message)
+
+    def test_overdue_waiter_asks_to_re_arm(self) -> None:
+        message = ghark.wake.wake_message(None, overdue=True)
+
+        assert message is not None
+        self.assertIn("re-arm", message)
+
+    def test_nothing_flagged_keeps_waiting(self) -> None:
+        self.assertIsNone(ghark.wake.wake_message(None, overdue=False))
+        self.assertIsNone(ghark.wake.wake_message("", overdue=False))
+
+    def test_margin_is_a_tenth_of_the_timeout_up_to_five_minutes(self) -> None:
+        self.assertEqual(ghark.wake.wake_after(86_400), 86_100)
+        self.assertEqual(ghark.wake.wake_after(600), 540)
+        self.assertEqual(ghark.wake.wake_after(30), 27)
+
+    def test_unusable_timeout_falls_back_to_the_default(self) -> None:
+        default = ghark.wake.DEFAULT_TIMEOUT
+        for argv in (["hook"], ["hook", "soon"], ["hook", "nan"], ["hook", "-5"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(ghark.wake.hook_timeout(argv), default)
+        self.assertEqual(ghark.wake.hook_timeout(["hook", "600"]), 600)
+
+    def test_session_id_comes_from_the_event_then_the_environment(self) -> None:
+        environ = {"CLAUDE_CODE_SESSION_ID": "from-env"}
+        cases = [
+            ({"session_id": "from-event"}, environ, "from-event"),
+            ({"session_id": "../escape"}, environ, "from-env"),
+            (None, environ, "from-env"),
+            ({}, {"CLAUDE_CODE_SESSION_ID": "a/b"}, None),
+            ({}, {}, None),
+        ]
+        for event, env, expected in cases:
+            with self.subTest(event=event, env=env):
+                self.assertEqual(ghark.wake.hook_session_id(event, env), expected)
+
+
+class WaiterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.env = _isolated_state(self)
+        for name, value in (("POLL_SECONDS", 0.01), ("SERVER_GRACE", 0.2)):
+            patcher = mock.patch.object(ghark.wake, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_flag_under_a_live_server_wakes_with_its_prs(self) -> None:
+        with ghark.wake.server_lease("s1"):
+            ghark.wake.raise_flag("s1", [_pr(12), _pr(13)])
+
+            message = ghark.wake.wait("s1", _never())
+
+        assert message is not None
+        self.assertIn("owner/repo#12, owner/repo#13", message)
+
+    def test_flag_without_a_server_is_stale_and_ignored(self) -> None:
+        ghark.wake.raise_flag("s1", [_pr(12)])
+
+        self.assertIsNone(ghark.wake.wait("s1", _never()))
+
+    def test_waiter_exits_quietly_once_the_server_is_gone(self) -> None:
+        started = time.monotonic()
+
+        self.assertIsNone(ghark.wake.wait("s1", _never()))
+        self.assertGreaterEqual(time.monotonic() - started, ghark.wake.SERVER_GRACE)
+
+    def test_overdue_waiter_wakes_to_re_arm(self) -> None:
+        with ghark.wake.server_lease("s1"):
+            message = ghark.wake.wait("s1", time.monotonic())
+
+        assert message is not None
+        self.assertIn("re-arm", message)
+
+    def test_second_waiter_for_a_session_returns_at_once(self) -> None:
+        with (
+            ghark.wake.server_lease("s1"),
+            ghark.wake._exclusive(ghark.wake._waiter_file("s1")),
+        ):
+            ghark.wake.raise_flag("s1", [_pr(12)])
+
+            self.assertIsNone(ghark.wake.wait("s1", _never()))
+
+    def test_lease_lowers_a_stale_flag_on_entry_and_on_exit(self) -> None:
+        flag = ghark.wake.pending_flag("s1")
+        ghark.wake.raise_flag("s1", [_pr(12)])
+
+        with ghark.wake.server_lease("s1"):
+            self.assertFalse(flag.exists())
+            ghark.wake.raise_flag("s1", [_pr(12)])
+
+        self.assertFalse(flag.exists())
+
+    def test_raise_flag_leaves_no_staging_file(self) -> None:
+        ghark.wake.raise_flag("s1", [_pr(12)])
+
+        names = [path.name for path in ghark.wake.ghark_state_dir().iterdir()]
+        self.assertEqual(names, ["s1.pending"])
+
+    def test_sweep_deletes_only_old_unlocked_files(self) -> None:
+        directory = ghark.wake.ghark_state_dir()
+        directory.mkdir(parents=True)
+        names = ["old.pending", "old.waiter", "held.alive", "new.pending", "ghark.log"]
+        for name in names:
+            (directory / name).touch()
+        old = time.time() - ghark.wake.ABANDONED_AGE - 1
+        for name in ("old.pending", "old.waiter", "held.alive", "ghark.log"):
+            os.utime(directory / name, (old, old))
+
+        with ghark.wake.server_lease("held"):
+            ghark.wake.sweep_state(time.time())
+
+        remaining = sorted(path.name for path in directory.iterdir())
+        self.assertEqual(remaining, ["ghark.log", "held.alive", "new.pending"])
+
+
+class WakeHookEntryPointTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.env = _isolated_state(self)
+
+    def test_hook_exits_2_with_the_message_on_stderr(self) -> None:
+        with ghark.wake.server_lease("s1"):
+            ghark.wake.raise_flag("s1", [_pr(12)])
+
+            result = _run_wake_hook({"session_id": "s1"}, self.env)
+
+        self.assertEqual(result.returncode, ghark.wake.WAKE)
+        self.assertIn("owner/repo#12", result.stderr)
+
+    def test_hook_without_a_usable_session_exits_quietly(self) -> None:
+        env = {k: v for k, v in self.env.items() if k != "CLAUDE_CODE_SESSION_ID"}
+
+        result = _run_wake_hook({"session_id": "../escape"}, env)
+
+        self.assertEqual(result.returncode, ghark.wake.QUIET)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(ghark.wake.ghark_state_dir().exists())
+
+
 def _event(
     *,
     command: str = "gh pr create --fill",
@@ -333,6 +480,38 @@ def _run_main(stdin: str) -> str:
     ):
         ghark.hooks.subscribe_hook()
     return stdout.getvalue()
+
+
+def _isolated_state(test: unittest.TestCase) -> dict[str, str]:
+    """Point the state directory at a temporary one for ``test``; return the env."""
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    env = dict(os.environ, XDG_STATE_HOME=directory.name)
+    patcher = mock.patch.dict(os.environ, env)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return env
+
+
+def _run_wake_hook(
+    event: dict[str, Any], env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", "import ghark.wake; ghark.wake.wake_hook()"],
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+
+def _pr(number: int) -> ghark.models.PullRequestRef:
+    return ghark.models.PullRequestRef("owner", "repo", number)
+
+
+def _never() -> float:
+    return time.monotonic() + 3600
 
 
 if __name__ == "__main__":

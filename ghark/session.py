@@ -69,10 +69,10 @@ class SessionState:
             self._enqueue(events)
         return events
 
-    def review_requests(self) -> list[str]:
+    def review_requests(self) -> tuple[PullRequestRef, ...]:
         """The PRs with unread actionable events, in queue order."""
-        prs = (str(event.pr) for event in self._pending if event.actionable)
-        return list(dict.fromkeys(prs))
+        prs = (event.pr for event in self._pending if event.actionable)
+        return tuple(dict.fromkeys(prs))
 
     def flush_pending(self) -> PendingBatch:
         events = tuple(self._pending)

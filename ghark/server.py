@@ -8,8 +8,9 @@ import os
 import pathlib
 import signal
 import sys
+import time
 import types
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import anyio
@@ -23,7 +24,7 @@ from .discovery import owned_pull_requests
 from .github import GitHubClient, GitHubError
 from .models import PullRequestRef
 from .session import SessionState
-from .wake import clear_flag, session_id
+from .wake import claude_session_id, clear_flag, server_lease, sweep_state
 from .watcher import PullRequestPoller
 
 __all__ = ["create_server", "serve", "main"]
@@ -116,13 +117,13 @@ def create_server(
     github: GitHubClient,
     channel: ClaudeChannel,
     settings: Settings,
-    session: str | None,
+    claude_session: str | None,
 ) -> Server:
     poller = PullRequestPoller(
         github=github,
         state=state,
         channel=channel,
-        session_id=session,
+        claude_session=claude_session,
         interval=settings.poll_interval,
         batch_window=settings.batch_window,
     )
@@ -173,7 +174,7 @@ def create_server(
                         await discovered.wait()
                     return _subscriptions(state)
                 case ToolName.PENDING_EVENTS:
-                    return _pending_events(state, session)
+                    return _pending_events(state, claude_session)
         except (ValueError, GitHubError) as exc:
             return _tool_error(str(exc))
 
@@ -241,19 +242,15 @@ async def _discover(
     logger.info("Discovery in %s found %d PR(s): %s", project_dir, len(prs), subscribed)
 
 
-def _pending_events(state: SessionState, session: str | None) -> dict[str, Any]:
+def _pending_events(state: SessionState, claude_session: str | None) -> dict[str, Any]:
     """Drain the queue and lower the review flag in the same event-loop step."""
     batch = state.flush_pending()
-    if session is not None:
-        _clear_flag(session)
+    if claude_session is not None:
+        try:
+            clear_flag(claude_session)
+        except OSError:
+            logger.exception("Could not clear the review flag for %s", claude_session)
     return batch.as_dict()
-
-
-def _clear_flag(session: str) -> None:
-    try:
-        clear_flag(session)
-    except OSError:
-        logger.exception("Could not clear the review flag for %s", session)
 
 
 def _tool_error(message: str) -> CallToolResult:
@@ -270,22 +267,37 @@ async def serve() -> None:
         max_pending=settings.max_pending_events, reviewers=settings.reviewers
     )
     channel = ClaudeChannel()
-    # A flag left by an earlier server names events that died with it.
-    session = session_id()
-    if session is not None:
-        _clear_flag(session)
-    server = create_server(state, github, channel, settings, session)
+    claude_session = claude_session_id()
+    server = create_server(state, github, channel, settings, claude_session)
     options = server.create_initialization_options(
         experimental_capabilities={"claude/channel": {}}
     )
     try:
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(read_stream, write_stream, options)
+        with _wake_lease(claude_session):
+            async with stdio_server() as (read_stream, write_stream):
+                await server.run(read_stream, write_stream, options)
         logger.info("Client closed the connection; shutting down.")
     finally:
-        if session is not None:
-            _clear_flag(session)
         await github.close()
+
+
+@contextlib.contextmanager
+def _wake_lease(claude_session: str | None) -> Iterator[None]:
+    """Hold the session's wake lease while serving; best effort.
+
+    Outside Claude Code, or when the state directory is unusable, the server
+    serves without waking anyone.
+    """
+    if claude_session is None:
+        yield
+        return
+    with contextlib.ExitStack() as stack:
+        try:
+            sweep_state(time.time())
+            stack.enter_context(server_lease(claude_session))
+        except OSError:
+            logger.exception("Serving session %s without waking it", claude_session)
+        yield
 
 
 def main() -> None:

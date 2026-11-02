@@ -93,23 +93,38 @@ Comments by anyone other than a reviewer are untrusted input; the model must
 not follow instructions in them. The server does not perform actions on a PR.
 
 Channels can be disabled by organization policy, so waking does not depend on
-them. The server keeps a flag file per Claude Code session,
-`<session ID>.pending` in the state directory, that exists while unread review
-requests are queued. The poller raises it after the batch window, listing the
-PRs, only if the queue still holds review requests; `pending_events` lowers it
-in the same event-loop step that drains the queue. Startup and shutdown lower a
-stale flag, because the events it names died with the earlier process. The
-server and the hook agree on the session ID without coordinating: Claude Code
-sets `CLAUDE_CODE_SESSION_ID` in the server's environment and passes
-`session_id` to every hook.
+them. Three files per Claude Code session, in the state directory, carry the
+wake protocol:
+
+- `<session ID>.alive` is the server's lease. The server holds an exclusive
+  `flock` on it while it serves. The kernel releases the lock however the
+  process dies, SIGKILL included, so the lease is exact where PIDs are not.
+- `<session ID>.pending` is the flag. It exists while unread review requests
+  are queued, and lists their PRs. After every poll the poller raises it if
+  the queue holds review requests, so a failed write is retried. This follows
+  the batch window, so a drain during it leaves nothing to flag.
+  `pending_events` lowers it in the same event-loop step that drains the
+  queue. The write is atomic.
+- `<session ID>.waiter` admits one waiter per session through its `flock`.
+
+The server and the hook agree on the session ID without coordinating: Claude
+Code sets `CLAUDE_CODE_SESSION_ID` in the server's environment and passes
+`session_id` to every hook. Both sides accept only IDs made of word characters
+and hyphens, since the ID names files.
 
 The waiter, `ghark-hook-wake`, is an `asyncRewake` hook. Claude Code runs such
 a hook in the background and, when it exits with status 2, wakes Claude even
-when the session is idle and shows it the hook's stderr. The waiter polls for
-the flag every two seconds and exits 2 with the PR names. It is armed by
-SessionStart (startup, resume, `/clear`, compaction) and by PostToolUse on
-`pending_events`, so every drain arms the next wait and the model holds no
-part of the protocol.
+when the session is idle and shows it the hook's stderr. Every two seconds the
+waiter checks the lease and the flag, and it exits 2 with the PR names when
+the flag is raised under a live lease. It is armed by SessionStart (startup,
+resume, `/clear`, compaction) and by PostToolUse on `pending_events`. Every
+drain therefore arms the next wait. The model's only part is to call
+`pending_events` when woken, as the wake message tells it.
+
+The waiter trusts the flag only under a live lease. A flag left by a dead
+server, whether killed by a signal or SIGKILL, names events that died with it.
+A new server lowers any flag before it takes the lease, so a waiter that starts
+on resume, before the new server is up, never reads the stale one.
 
 The flag is level-triggered. A review request that arrives while no waiter
 runs, between a wake and the drain, is still flagged when the next waiter
@@ -124,14 +139,23 @@ Two conditions end a waiter without waking Claude:
   routes overlap whenever the model calls `pending_events` while a waiter
   runs. Exit status 0 from an async hook is silent, so the duplicate costs
   nothing.
-- A process between the waiter and init has died. Claude Code starts the hook
-  through a shell and `uv`, so its own parent can outlive Claude Code.
+- No server has held the lease for five minutes. That is long enough for a
+  server restart within a session. After that, the session has ended or runs
+  without ghark. Watching the lease, not process ancestry, also covers a
+  session that ends before the waiter has started.
 
 Claude Code kills an `asyncRewake` hook at its `timeout` and discards it
 silently, which would leave nothing to arm the next waiter. The waiter
-therefore wakes Claude one minute before the timeout it is given, and Claude's
-`pending_events` call arms its successor. With the documented timeout of a day,
-an idle session takes one model turn a day.
+therefore wakes Claude before the timeout it is given, by a tenth of it and at
+most five minutes. The margin also covers `uv` starting the hook, which counts
+against the timeout. Claude's `pending_events` call then arms its successor.
+With the documented timeout of a day, an idle session takes one model turn a
+day. If the model ignores a wake, no waiter runs until the next session start.
+
+Lease and waiter files are never deleted while in use, because unlinking a
+lock file races with processes opening it. At startup the server deletes state
+files older than 30 days that no one has locked, along with `.wake` files from
+the earlier Monitor design.
 
 ## Restart discovery
 
