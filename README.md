@@ -60,8 +60,8 @@ you want to check for activity.
 - `subscribe` watches its `pr` argument. It accepts a GitHub PR URL or
   `OWNER/REPO#N`.
 - `unsubscribe` takes the same `pr` argument and stops watching it.
-- `subscriptions` lists this process's active PRs. When any exist, it also
-  returns the Monitor command. It waits up to 30 seconds for startup discovery
+- `subscriptions` lists this process's active PRs. It waits up to 30 seconds
+  for startup discovery
   to finish.
 - `pending_events` returns unread events and reports any events dropped at the
   queue limit.
@@ -81,20 +81,19 @@ login. The server instructions tell it to end every comment with Claude Code's
 signature, `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 Signed comments are never actionable, so Claude's replies do not wake it.
 
-Actionable events wake the session through Claude Code's Monitor tool, which
-works where channels are disabled by policy. Each server process appends a line
-to `<log directory>/<pid>.wake` when a poll finds review requests. The
-`subscribe` result gives the Monitor command that tails it. A monitor expires
-after 30 minutes; the expiry also wakes the session, which calls
-`pending_events` and starts the monitor again. The wake line is only a signal:
-`pending_events` remains the durable read path.
+Actionable events wake the session through the wake hook (see
+[Hooks](#hooks)), which works where channels are disabled by policy. While
+review requests are unread, the server keeps a flag file,
+`<state directory>/<session ID>.pending`, naming their PRs; `pending_events`
+removes it. The hook waits for the flag and then wakes Claude, even when the
+session is idle. The flag is only a signal: `pending_events` remains the
+durable read path. A session that is not waiting on review costs nothing.
 
 ## Restarted sessions
 
 Subscriptions and unread events live in memory, and they end with the stdio
 server process. A resumed or restarted Claude Code session starts a new
-process. That process has no subscriptions, and the monitor that was tailing
-the old wake file is gone.
+process. That process has no subscriptions.
 
 On startup the server rediscovers the PRs that the session most plausibly owns.
 Nothing is written to disk. In the background, it finds the git checkout of the
@@ -105,9 +104,8 @@ are ignored: in a busy repository they name many PRs, some stale, and every
 session would wake on every review. A session in a worktree finds the main
 checkout's branch, since `CLAUDE_PROJECT_DIR` names the main checkout; the
 subscribe hook covers PRs it opens. Each PR gets the normal baseline, so
-old activity is not replayed. The server instructions tell the model to call
-`subscriptions` at the start of a session. If anything is listed, the model
-starts the Monitor command that the result names.
+old activity is not replayed. The wake hook re-arms at every session start,
+so nothing is asked of the model.
 
 The project directory is `CLAUDE_PROJECT_DIR`, then `PWD`, then the working
 directory. Claude Code sets `CLAUDE_PROJECT_DIR` for stdio servers. The
@@ -125,8 +123,17 @@ how many older events were dropped when that limit was reached.
 
 ## Hooks
 
-Two Claude Code hooks back up the server instructions. The model can forget
-either rule, and nothing reports the miss.
+Three Claude Code hooks do what the model could forget, with nothing to
+report the miss.
+
+- `ghark-hook-wake` (SessionStart and PostToolUse on `pending_events`, both
+  `asyncRewake`) waits for review requests and wakes Claude when they arrive.
+  It starts with every session and again after every `pending_events` call,
+  so the model never arms it. A second waiter for the same session exits at
+  once and silently. Claude Code kills a hook at its `timeout` without telling
+  Claude, so the waiter wakes Claude a minute before it: about once a day,
+  Claude calls `pending_events`, which arms the next waiter. The waiter exits
+  quietly when the Claude Code process that started it exits.
 
 - `ghark-hook-signature` (PreToolUse) denies Bash commands that post an
   unsigned PR comment or review. An unsigned reply from Claude counts as a
@@ -134,7 +141,7 @@ either rule, and nothing reports the miss.
   a loop. The denial tells Claude to append the signature line and retry.
 - `ghark-hook-subscribe` (PostToolUse) runs after a successful `gh pr create`
   (or `gh pr new`). It tells Claude to call `subscribe` with the URL the
-  command printed and to start the Monitor the result names.
+  command printed.
 
 Add them to `~/.claude/settings.json` or to a project's `.claude/settings.json`:
 
@@ -154,7 +161,30 @@ Add them to `~/.claude/settings.json` or to a project's `.claude/settings.json`:
         ]
       }
     ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --quiet --directory /path/to/checkout ghark-hook-wake 86400",
+            "asyncRewake": true,
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
+      {
+        "matcher": "mcp__ghark__pending_events",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --quiet --directory /path/to/checkout ghark-hook-wake 86400",
+            "asyncRewake": true,
+            "timeout": 86400
+          }
+        ]
+      },
       {
         "matcher": "Bash",
         "hooks": [
@@ -171,8 +201,8 @@ Add them to `~/.claude/settings.json` or to a project's `.claude/settings.json`:
 }
 ```
 
-The `if` filter starts the hooks only for `gh` commands, including each
-command in a `&&` chain.
+The `if` filter starts the Bash hooks only for `gh` commands, including each
+command in a `&&` chain. The wake hook's argument must match its `timeout`.
 
 The signature hook checks these commands:
 

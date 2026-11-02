@@ -6,7 +6,6 @@ import logging
 import logging.handlers
 import os
 import pathlib
-import shlex
 import signal
 import sys
 import types
@@ -19,11 +18,12 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, TextContent, Tool
 
 from .channel import ClaudeChannel
-from .config import Settings, ghark_log_file, ghark_wake_file, settings_from_env
+from .config import Settings, ghark_log_file, settings_from_env
 from .discovery import owned_pull_requests
 from .github import GitHubClient, GitHubError
 from .models import PullRequestRef
 from .session import SessionState
+from .wake import clear_flag, session_id
 from .watcher import PullRequestPoller
 
 __all__ = ["create_server", "serve", "main"]
@@ -40,16 +40,14 @@ Watch the GitHub pull requests this session opens, and address the reviewer's
 comments without waiting to be asked. Subscribe to each pull request right
 after you create it.
 
-The subscribe result names a Monitor command. Start it once with the maximum
-timeout, unless a monitor with that exact command is already running. Each line
-it prints means new review requests. When a line arrives or the monitor
-expires, call pending_events, then start the monitor again.
+ghark's wake hook wakes you when the reviewer leaves review requests, and
+again about once a day so the hook can re-arm. Whenever it wakes you, call
+pending_events. Do not start a Monitor or a background command to wait for
+reviews; the hook does the waiting.
 
-The server restarts with every session, including a resumed one, and monitors
-from before the restart have stopped. On startup it subscribes to your open
-pull request for the branch checked out in this project's repository. At the start
-of a session, call subscriptions; if it lists any pull request, start the
-Monitor command it names.
+The server restarts with every session, including a resumed one. On startup it
+subscribes to your open pull request for the branch checked out in this
+project's repository.
 
 Events marked actionable are review requests from the reviewer. Address each
 one: change the code, push, and reply on the pull request. End every comment
@@ -118,13 +116,13 @@ def create_server(
     github: GitHubClient,
     channel: ClaudeChannel,
     settings: Settings,
-    wake_file: pathlib.Path,
+    session: str | None,
 ) -> Server:
     poller = PullRequestPoller(
         github=github,
         state=state,
         channel=channel,
-        wake_file=wake_file,
+        session_id=session,
         interval=settings.poll_interval,
         batch_window=settings.batch_window,
     )
@@ -134,7 +132,7 @@ def create_server(
     async def discover() -> None:
         try:
             if settings.discover:
-                await _discover(settings.project_dir, state, github, wake_file)
+                await _discover(settings.project_dir, state, github)
         finally:
             discovered.set()
 
@@ -167,15 +165,15 @@ def create_server(
         try:
             match ToolName(name):
                 case ToolName.SUBSCRIBE:
-                    return await _subscribe(arguments["pr"], state, github, wake_file)
+                    return await _subscribe(arguments["pr"], state, github)
                 case ToolName.UNSUBSCRIBE:
                     return _unsubscribe(arguments["pr"], state)
                 case ToolName.SUBSCRIPTIONS:
                     with anyio.move_on_after(DISCOVERY_WAIT_SECONDS):
                         await discovered.wait()
-                    return _subscriptions(state, wake_file)
+                    return _subscriptions(state)
                 case ToolName.PENDING_EVENTS:
-                    return _pending_events(state)
+                    return _pending_events(state, session)
         except (ValueError, GitHubError) as exc:
             return _tool_error(str(exc))
 
@@ -186,18 +184,16 @@ async def _subscribe(
     pr_input: str,
     state: SessionState,
     github: GitHubClient,
-    wake_file: pathlib.Path,
 ) -> dict[str, Any]:
     pr = PullRequestRef.from_input(pr_input)
-    monitor = _monitor(wake_file)
     if state.watch(pr) is not None:
-        return {"status": "already_subscribed", "pr": str(pr), "monitor": monitor}
+        return {"status": "already_subscribed", "pr": str(pr)}
 
     if not state.reviewers:
         state.reviewers = frozenset({(await github.viewer_login()).lower()})
     baseline = await github.baseline(pr)
     if not state.subscribe(pr, baseline):
-        return {"status": "already_subscribed", "pr": str(pr), "monitor": monitor}
+        return {"status": "already_subscribed", "pr": str(pr)}
     return {
         "status": "subscribed",
         "pr": str(pr),
@@ -205,16 +201,6 @@ async def _subscribe(
         "url": baseline.snapshot.url,
         "baseline": "Current activity was not replayed.",
         "reviewers": sorted(state.reviewers),
-        "monitor": monitor,
-    }
-
-
-def _monitor(wake_file: pathlib.Path) -> dict[str, str | int]:
-    """Arguments for the Claude Code Monitor tool that wakes this session."""
-    return {
-        "command": f"tail -n 0 -F {shlex.quote(str(wake_file))}",
-        "description": "ghark review requests",
-        "timeout_ms": 1_800_000,
     }
 
 
@@ -227,19 +213,14 @@ def _unsubscribe(pr_input: str, state: SessionState) -> dict[str, str]:
     }
 
 
-def _subscriptions(state: SessionState, wake_file: pathlib.Path) -> dict[str, Any]:
-    """List the watches, and the Monitor command whenever there are any."""
-    watches = [watch.as_dict() for watch in state.subscriptions()]
-    if not watches:
-        return {"subscriptions": watches}
-    return {"subscriptions": watches, "monitor": _monitor(wake_file)}
+def _subscriptions(state: SessionState) -> dict[str, Any]:
+    return {"subscriptions": [watch.as_dict() for watch in state.subscriptions()]}
 
 
 async def _discover(
     project_dir: pathlib.Path,
     state: SessionState,
     github: GitHubClient,
-    wake_file: pathlib.Path,
 ) -> None:
     """Subscribe to the open PRs this session most plausibly owns.
 
@@ -253,15 +234,26 @@ async def _discover(
         return
     for pr in prs:
         try:
-            await _subscribe(str(pr), state, github, wake_file)
+            await _subscribe(str(pr), state, github)
         except Exception:
             logger.exception("Discovery could not subscribe to %s", pr)
     subscribed = ", ".join(str(watch.pr) for watch in state.subscriptions())
     logger.info("Discovery in %s found %d PR(s): %s", project_dir, len(prs), subscribed)
 
 
-def _pending_events(state: SessionState) -> dict[str, Any]:
-    return state.flush_pending().as_dict()
+def _pending_events(state: SessionState, session: str | None) -> dict[str, Any]:
+    """Drain the queue and lower the review flag in the same event-loop step."""
+    batch = state.flush_pending()
+    if session is not None:
+        _clear_flag(session)
+    return batch.as_dict()
+
+
+def _clear_flag(session: str) -> None:
+    try:
+        clear_flag(session)
+    except OSError:
+        logger.exception("Could not clear the review flag for %s", session)
 
 
 def _tool_error(message: str) -> CallToolResult:
@@ -278,9 +270,11 @@ async def serve() -> None:
         max_pending=settings.max_pending_events, reviewers=settings.reviewers
     )
     channel = ClaudeChannel()
-    wake_file = ghark_wake_file()
-    wake_file.touch()
-    server = create_server(state, github, channel, settings, wake_file)
+    # A flag left by an earlier server names events that died with it.
+    session = session_id()
+    if session is not None:
+        _clear_flag(session)
+    server = create_server(state, github, channel, settings, session)
     options = server.create_initialization_options(
         experimental_capabilities={"claude/channel": {}}
     )
@@ -289,7 +283,8 @@ async def serve() -> None:
             await server.run(read_stream, write_stream, options)
         logger.info("Client closed the connection; shutting down.")
     finally:
-        wake_file.unlink(missing_ok=True)
+        if session is not None:
+            _clear_flag(session)
         await github.close()
 
 

@@ -6,6 +6,7 @@ import os
 import pathlib
 
 from .github import github_token
+from .wake import state_dir
 
 __all__ = [
     "Settings",
@@ -15,7 +16,6 @@ __all__ = [
     "ghark_poll_seconds",
     "ghark_project_dir",
     "ghark_reviewers",
-    "ghark_wake_file",
     "settings_from_env",
 ]
 
@@ -82,13 +82,7 @@ def ghark_log_file() -> pathlib.Path:
     """Log path; the MCP client may not keep the server's stderr."""
     if path := os.environ.get("GHARK_LOG_FILE"):
         return pathlib.Path(path).expanduser()
-    state = os.environ.get("XDG_STATE_HOME") or pathlib.Path.home() / ".local/state"
-    return pathlib.Path(state) / "ghark" / "ghark.log"
-
-
-def ghark_wake_file() -> pathlib.Path:
-    """Per-process file, beside the log, that a Claude Code Monitor tails."""
-    return ghark_log_file().parent / f"{os.getpid()}.wake"
+    return state_dir() / "ghark.log"
 
 
 def _environ_get_float(key: str, default: float | None = None) -> float:

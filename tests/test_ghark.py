@@ -3,12 +3,15 @@
 import asyncio
 import dataclasses
 import datetime
+import fcntl
 import json
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from collections.abc import Callable
@@ -30,6 +33,7 @@ import ghark.github
 import ghark.models
 import ghark.server
 import ghark.session
+import ghark.wake
 import ghark.watcher
 
 
@@ -540,14 +544,20 @@ class ReviewerRequestTests(unittest.TestCase):
 
 
 class PollerWakeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_wake_file_gets_one_line_per_pr_with_requests(self) -> None:
+    def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        wake_file = pathlib.Path(directory.name) / "1.wake"
-        pr = ghark.models.PullRequestRef("owner", "repo", 12)
+        patcher = unittest.mock.patch.dict(
+            os.environ, {"XDG_STATE_HOME": directory.name}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.flag = ghark.wake.pending_flag("s1")
+
+    def poller(
+        self, state: ghark.session.SessionState, session: str | None = "s1"
+    ) -> ghark.watcher.PullRequestPoller:
         cursor = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
-        state = ghark.session.SessionState(reviewers=frozenset({"reviewer"}))
-        state.subscribe(pr, ghark.models.Baseline(_snapshot(), None, cursor))
         entries = (
             ghark.models.TimelineEntry(
                 ghark.models.ActivityKind.COMMENT, "Rename this.", "reviewer"
@@ -563,37 +573,159 @@ class PollerWakeTests(unittest.IsolatedAsyncioTestCase):
             ) -> ghark.models.PollResult:
                 return ghark.models.PollResult(_snapshot(), "next", cursor, entries, ())
 
-        poller = ghark.watcher.PullRequestPoller(
+        return ghark.watcher.PullRequestPoller(
             github=GitHub(),  # type: ignore[arg-type]
             state=state,
             channel=ghark.channel.ClaudeChannel(),
-            wake_file=wake_file,
+            session_id=session,
             interval=30,
             batch_window=0,
         )
-        await poller.poll()
 
-        self.assertEqual(
-            wake_file.read_text(),
-            "owner/repo#12: 1 review request(s); call pending_events\n",
-        )
+    def subscribed_state(self) -> ghark.session.SessionState:
+        cursor = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+        state = ghark.session.SessionState(reviewers=frozenset({"reviewer"}))
+        pr = ghark.models.PullRequestRef("owner", "repo", 12)
+        state.subscribe(pr, ghark.models.Baseline(_snapshot(), None, cursor))
+        return state
+
+    async def test_review_request_raises_the_flag_with_its_pr(self) -> None:
+        state = self.subscribed_state()
+
+        await self.poller(state).poll()
+
+        self.assertEqual(self.flag.read_text(), "owner/repo#12\n")
         self.assertEqual(len(state.flush_pending().events), 2)
 
-    async def test_no_wake_without_requests(self) -> None:
+    async def test_pending_events_lowers_the_flag(self) -> None:
+        state = self.subscribed_state()
+        await self.poller(state).poll()
+
+        drained = ghark.server._pending_events(state, "s1")
+
+        self.assertEqual(len(drained["events"]), 2)
+        self.assertFalse(self.flag.exists())
+
+    async def test_no_flag_when_drained_during_the_batch_window(self) -> None:
+        state = self.subscribed_state()
+        poller = self.poller(state)
+        poller.batch_window = 0.05
+
+        poll = asyncio.create_task(poller.poll())
+        await asyncio.sleep(0.01)
+        ghark.server._pending_events(state, "s1")
+        await poll
+
+        self.assertFalse(self.flag.exists())
+
+    async def test_no_flag_without_requests(self) -> None:
+        await self.poller(ghark.session.SessionState()).poll()
+
+        self.assertFalse(self.flag.exists())
+
+    async def test_no_flag_outside_claude_code(self) -> None:
+        await self.poller(self.subscribed_state(), session=None).poll()
+
+        self.assertFalse(ghark.wake.state_dir().exists())
+
+
+class WaiterTests(unittest.TestCase):
+    def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        wake_file = pathlib.Path(directory.name) / "1.wake"
-        poller = ghark.watcher.PullRequestPoller(
-            github=None,  # type: ignore[arg-type]
-            state=ghark.session.SessionState(),
-            channel=ghark.channel.ClaudeChannel(),
-            wake_file=wake_file,
-            interval=30,
-            batch_window=0,
-        )
-        await poller.poll()
+        self.env = os.environ | {"XDG_STATE_HOME": directory.name}
+        patcher = unittest.mock.patch.dict(os.environ, self.env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        ghark.wake.state_dir().mkdir(parents=True)
 
-        self.assertFalse(wake_file.exists())
+    def run_hook(self, timeout: str = "86400") -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import ghark.wake; ghark.wake.wake_hook()",
+                timeout,
+            ],
+            input=json.dumps({"session_id": "s1", "hook_event_name": "SessionStart"}),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=30,
+        )
+
+    def test_raised_flag_wakes_with_the_prs(self) -> None:
+        ghark.wake.raise_flag("s1", ["owner/repo#12", "owner/repo#13"])
+
+        result = self.run_hook()
+
+        self.assertEqual(result.returncode, ghark.wake.WAKE)
+        self.assertIn("owner/repo#12, owner/repo#13", result.stderr)
+        self.assertIn("pending_events", result.stderr)
+
+    def test_flag_raised_while_waiting_wakes(self) -> None:
+        timer = threading.Timer(1, ghark.wake.raise_flag, ("s1", ["owner/repo#12"]))
+        timer.start()
+        self.addCleanup(timer.cancel)
+
+        result = self.run_hook()
+
+        self.assertEqual(result.returncode, ghark.wake.WAKE)
+        self.assertIn("owner/repo#12", result.stderr)
+
+    def test_waiter_wakes_before_the_hook_timeout(self) -> None:
+        result = self.run_hook(timeout=str(ghark.wake.TIMEOUT_MARGIN))
+
+        self.assertEqual(result.returncode, ghark.wake.WAKE)
+        self.assertIn("re-arm", result.stderr)
+
+    def test_second_waiter_for_a_session_exits_quietly(self) -> None:
+        ghark.wake.raise_flag("s1", ["owner/repo#12"])
+        with (ghark.wake.state_dir() / "s1.waiter").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+
+            result = self.run_hook()
+
+        self.assertEqual(result.returncode, ghark.wake.QUIET)
+        self.assertEqual(result.stderr, "")
+
+    def test_session_id_that_is_not_a_plain_name_exits_quietly(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-c", "import ghark.wake; ghark.wake.wake_hook()"],
+            input=json.dumps({"session_id": "../escape"}),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, ghark.wake.QUIET)
+        self.assertEqual(list(ghark.wake.state_dir().iterdir()), [])
+
+    def test_waiter_exits_quietly_when_an_ancestor_dies(self) -> None:
+        # The shell stands in for Claude Code; the waiter's parent is a
+        # subshell that outlives it, as uv outlives Claude Code.
+        script = (
+            f"({sys.executable} -c 'import ghark.wake; ghark.wake.wake_hook()' "
+            "</dev/null >/dev/null 2>&1 & echo $!; wait) & sleep 30"
+        )
+        shell = subprocess.Popen(
+            ["sh", "-c", script],
+            stdout=subprocess.PIPE,
+            text=True,
+            env=self.env | {"CLAUDE_CODE_SESSION_ID": "s1"},
+        )
+        assert shell.stdout is not None
+        waiter = int(shell.stdout.readline())
+        time.sleep(1)
+        self.assertTrue(ghark.wake._alive(waiter))
+        shell.kill()
+        shell.wait()
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and ghark.wake._alive(waiter):
+            time.sleep(0.2)
+        self.assertFalse(ghark.wake._alive(waiter))
 
 
 class DiscoveryConfigTests(unittest.TestCase):
@@ -651,15 +783,14 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([str(pr) for pr in owned], ["owner/repo#1", "upstream/repo#4"])
 
-    async def test_discover_subscribes_with_baseline_and_names_monitor(self) -> None:
+    async def test_discover_subscribes_with_baseline(self) -> None:
         requests: list[str] = []
         github = await _mock_client(_discovery_responder(self.AUTHORED, requests))
         self.addAsyncCleanup(github.close)
         state = ghark.session.SessionState()
-        wake_file = self.repo / "1.wake"
 
-        await ghark.server._discover(self.repo, state, github, wake_file)
-        listed = ghark.server._subscriptions(state, wake_file)
+        await ghark.server._discover(self.repo, state, github)
+        listed = ghark.server._subscriptions(state)
 
         self.assertEqual(
             [watch.pr for watch in state.subscriptions()],
@@ -670,7 +801,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(state.subscriptions()[0].timeline_cursor, "cursor-1")
         self.assertEqual(state.reviewers, frozenset({"me"}))
-        self.assertEqual(listed["monitor"], ghark.server._monitor(wake_file))
+        self.assertEqual(len(listed["subscriptions"]), 2)
         self.assertEqual(requests.count("ViewerPullRequests"), 1)
         self.assertEqual(state.flush_pending().events, ())
 
@@ -682,13 +813,10 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         state = ghark.session.SessionState()
 
         with self.assertLogs("ghark", "WARNING") as logs:
-            await ghark.server._discover(
-                pathlib.Path(directory.name), state, github, self.repo / "1.wake"
-            )
+            await ghark.server._discover(pathlib.Path(directory.name), state, github)
 
         self.assertEqual(state.subscriptions(), ())
         self.assertIn("Discovery skipped", logs.output[0])
-        self.assertNotIn("monitor", ghark.server._subscriptions(state, self.repo))
 
     async def test_discover_logs_and_continues_on_github_failure(self) -> None:
         github = await _mock_client(lambda _: httpx.Response(502))
@@ -696,7 +824,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         state = ghark.session.SessionState()
 
         with self.assertLogs("ghark", "WARNING") as logs:
-            await ghark.server._discover(self.repo, state, github, self.repo / "w")
+            await ghark.server._discover(self.repo, state, github)
 
         self.assertEqual(state.subscriptions(), ())
         self.assertIn("502", logs.output[0])
@@ -714,7 +842,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         state = ghark.session.SessionState()
 
         with self.assertLogs("ghark", "ERROR"):
-            await ghark.server._discover(self.repo, state, github, self.repo / "w")
+            await ghark.server._discover(self.repo, state, github)
 
         self.assertEqual(
             [str(watch.pr) for watch in state.subscriptions()], ["upstream/repo#4"]
@@ -766,9 +894,14 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
                 "GH_TOKEN": "test-token",
                 "GHARK_LOG_FILE": str(log_file),
                 "CLAUDE_PROJECT_DIR": log_dir.name,
+                "CLAUDE_CODE_SESSION_ID": "s1",
+                "XDG_STATE_HOME": log_dir.name,
             },
             cwd=str(pathlib.Path.cwd()),
         )
+        stale = pathlib.Path(log_dir.name) / "ghark" / "s1.pending"
+        stale.parent.mkdir()
+        stale.write_text("owner/repo#1\n")
         async with asyncio.timeout(15):
             async with stdio_client(parameters) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as client:
@@ -791,7 +924,7 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
             unsubscribed.structuredContent,
             {"status": "not_subscribed", "pr": "owner/repo#12"},
         )
-        self.assertEqual(list(log_file.parent.glob("*.wake")), [])
+        self.assertFalse(stale.exists())
         log = log_file.read_text()
         self.assertIn("ghark 0.1.0 started", log)
         self.assertIn(f"Discovery skipped in {log_dir.name}", log)

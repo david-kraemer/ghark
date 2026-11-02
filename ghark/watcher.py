@@ -3,12 +3,12 @@
 import asyncio
 import dataclasses
 import logging
-import pathlib
 
 from .channel import ClaudeChannel
 from .github import GitHubClient
-from .models import ActivityEvent, ChannelMessage
+from .models import ActivityEvent
 from .session import SessionState
+from .wake import raise_flag
 
 __all__ = ["PullRequestPoller"]
 
@@ -22,7 +22,8 @@ class PullRequestPoller:
     github: GitHubClient
     state: SessionState
     channel: ClaudeChannel
-    wake_file: pathlib.Path
+    #: Claude Code session whose waiter to wake; ``None`` outside Claude Code.
+    session_id: str | None
     interval: float
     batch_window: float
 
@@ -46,20 +47,18 @@ class PullRequestPoller:
         if batch:
             if self.batch_window:
                 await asyncio.sleep(self.batch_window)
-            self._wake(tuple(event for event in batch if event.actionable))
+            self._wake()
             await self.channel.send(tuple(batch))
 
-    def _wake(self, events: tuple[ActivityEvent, ...]) -> None:
-        """Append one line per PR with reviewer requests to the wake file."""
-        lines = "".join(
-            f"{message.pr}: {message.event_count} review request(s); "
-            "call pending_events\n"
-            for message in ChannelMessage.from_events(events)
-        )
-        if not lines:
+    def _wake(self) -> None:
+        """Flag the PRs with unread review requests for the session's waiter.
+
+        Checked after the batch window: a drain during it leaves nothing to flag.
+        """
+        prs = self.state.review_requests()
+        if self.session_id is None or not prs:
             return
         try:
-            with self.wake_file.open("a") as wake:
-                wake.write(lines)
+            raise_flag(self.session_id, prs)
         except OSError:
-            logger.exception("Could not write wake file %s", self.wake_file)
+            logger.exception("Could not raise the review flag for %s", self.session_id)

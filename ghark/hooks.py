@@ -359,12 +359,11 @@ def subscribe_context(event: dict[str, Any]) -> str | None:
         return (
             "A pull request was just created with `gh pr create`. Call the "
             f"`{SUBSCRIBE_TOOL}` tool with its URL so ghark watches it for "
-            "review activity, then start the Monitor the result names, if any."
+            "review activity."
         )
     return (
         f"Pull request {url} was just created. Call the `{SUBSCRIBE_TOOL}` tool "
-        f'with `pr` set to "{url}" so ghark watches it for review activity, '
-        "then start the Monitor the result names, if any."
+        f'with `pr` set to "{url}" so ghark watches it for review activity.'
     )
 
 

@@ -21,6 +21,7 @@ dev = ["ruff>=0.12"]
 ghark = "ghark.server:main"
 ghark-hook-signature = "ghark.hooks:signature_hook"
 ghark-hook-subscribe = "ghark.hooks:subscribe_hook"
+ghark-hook-wake = "ghark.wake:wake_hook"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ghark"]

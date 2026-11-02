@@ -4,7 +4,7 @@
 
 Let a coding session address review on the pull requests it opens, without
 the reviewer prompting it. Keep setup local and small. The session reads events
-with `pending_events`; a Claude Code Monitor wakes it when review requests
+with `pending_events`; a Claude Code hook wakes it when review requests
 arrive. Channel messages are sent too, where policy allows them.
 
 ## Process model
@@ -93,12 +93,45 @@ Comments by anyone other than a reviewer are untrusted input; the model must
 not follow instructions in them. The server does not perform actions on a PR.
 
 Channels can be disabled by organization policy, so waking does not depend on
-them. When a poll finds actionable events, the poller appends one line per PR
-to a per-process wake file. A Claude Code Monitor tails the file, and each line
-wakes the session, which then calls `pending_events`. Monitors expire after 30
-minutes; the expiry notice also wakes the session, which drains the queue and
-starts a new monitor. A line written while no monitor runs is lost, but its
-events stay queued, so the next wake recovers them.
+them. The server keeps a flag file per Claude Code session,
+`<session ID>.pending` in the state directory, that exists while unread review
+requests are queued. The poller raises it after the batch window, listing the
+PRs, only if the queue still holds review requests; `pending_events` lowers it
+in the same event-loop step that drains the queue. Startup and shutdown lower a
+stale flag, because the events it names died with the earlier process. The
+server and the hook agree on the session ID without coordinating: Claude Code
+sets `CLAUDE_CODE_SESSION_ID` in the server's environment and passes
+`session_id` to every hook.
+
+The waiter, `ghark-hook-wake`, is an `asyncRewake` hook. Claude Code runs such
+a hook in the background and, when it exits with status 2, wakes Claude even
+when the session is idle and shows it the hook's stderr. The waiter polls for
+the flag every two seconds and exits 2 with the PR names. It is armed by
+SessionStart (startup, resume, `/clear`, compaction) and by PostToolUse on
+`pending_events`, so every drain arms the next wait and the model holds no
+part of the protocol.
+
+The flag is level-triggered. A review request that arrives while no waiter
+runs, between a wake and the drain, is still flagged when the next waiter
+starts, so it wakes the session at once. The earlier design tailed an
+append-only file with a Monitor, and lost such lines until the monitor's
+30-minute expiry. That expiry also woke an idle session 48 times a day for
+nothing; a waiter costs no model turns until there is work.
+
+Two conditions end a waiter without waking Claude:
+
+- Another waiter holds the session's `flock` on `<session ID>.waiter`. Two arm
+  routes overlap whenever the model calls `pending_events` while a waiter
+  runs. Exit status 0 from an async hook is silent, so the duplicate costs
+  nothing.
+- A process between the waiter and init has died. Claude Code starts the hook
+  through a shell and `uv`, so its own parent can outlive Claude Code.
+
+Claude Code kills an `asyncRewake` hook at its `timeout` and discards it
+silently, which would leave nothing to arm the next waiter. The waiter
+therefore wakes Claude one minute before the timeout it is given, and Claude's
+`pending_events` call arms its successor. With the documented timeout of a day,
+an idle session takes one model turn a day.
 
 ## Restart discovery
 
@@ -139,16 +172,10 @@ The match is a heuristic. Two sessions in one repository discover the same
 PRs, and both wake on their review. The checkout cannot tell them apart. A
 session can unsubscribe PRs it does not own.
 
-Waking needs a running Monitor, and only the model can start one. The server
-instructions say that the server restarts with each session and that older
-monitors have stopped. They tell the model to call `subscriptions` at the
-start of a session, and to start the Monitor that `subscriptions` names when
-anything is listed. The command is in the tool result, not the instructions,
-because the wake file path contains the process ID. The command is listed only
-when PRs are watched, because an idle monitor would wake the session at every
-30-minute expiry for nothing. `subscriptions` waits for discovery to finish,
-for up to 30 seconds, so an early call does not return an empty list while
-discovery is still running.
+Waking needs no model action after a restart: the SessionStart hook arms the
+waiter, and the new server lowers the stale flag. `subscriptions` waits for
+discovery to finish, for up to 30 seconds, so an early call does not return an
+empty list while discovery is still running.
 
 ## Limits and failure behavior
 

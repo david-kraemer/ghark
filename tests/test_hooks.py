@@ -234,7 +234,7 @@ class SubscribeContextTests(unittest.TestCase):
         assert context is not None
         self.assertIn(f'"{PR_URL}"', context)
         self.assertIn("mcp__ghark__subscribe", context)
-        self.assertIn("Monitor", context)
+        self.assertNotIn("Monitor", context)
 
     def test_uses_last_url_on_stdout(self) -> None:
         stdout = f"See https://github.com/owner/repo/pull/3 for context\n{PR_URL}\n"
